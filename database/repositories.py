@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 from pathlib import Path
 
 from database.sqlite_db import DatabaseManager
@@ -30,6 +31,7 @@ class AppRepository:
                     p.id,
                     p.name,
                     p.project_type,
+                    p.storage_path,
                     p.updated_at,
                     (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS task_count,
                     (
@@ -68,6 +70,7 @@ class AppRepository:
                 annotation_count=row["annotation_count"],
                 updated_at=row["updated_at"],
                 preview_image_path=row["preview_image_path"],
+                storage_path=row["storage_path"],
             )
             for row in rows
         ]
@@ -77,29 +80,31 @@ class AppRepository:
         name: str,
         project_type: str,
         labels: list[LabelTemplate],
+        storage_path: str | None,
     ) -> int:
         timestamp = self._now()
         with self.database.connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO projects(name, project_type, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO projects(name, project_type, storage_path, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (name, project_type, timestamp, timestamp),
+                (name, project_type, storage_path, timestamp, timestamp),
             )
             project_id = int(cursor.lastrowid)
 
             for label in labels:
                 connection.execute(
                     """
-                    INSERT INTO label_templates(project_id, name, label_type, preview_image_path, created_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO label_templates(project_id, name, label_type, preview_image_path, preview_definition_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         project_id,
                         label.name,
                         label.label_type,
                         label.preview_image_path,
+                        json.dumps(label.preview_definition, ensure_ascii=False) if label.preview_definition is not None else None,
                         timestamp,
                     ),
                 )
@@ -109,7 +114,7 @@ class AppRepository:
         with self.database.connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, name, project_type, created_at, updated_at
+                SELECT id, name, project_type, storage_path, created_at, updated_at
                 FROM projects
                 WHERE id = ?
                 """,
@@ -124,13 +129,14 @@ class AppRepository:
             project_type=row["project_type"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            storage_path=row["storage_path"],
         )
 
     def list_label_templates(self, project_id: int) -> list[LabelTemplate]:
         with self.database.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, name, label_type, preview_image_path
+                SELECT id, name, label_type, preview_image_path, preview_definition_json
                 FROM label_templates
                 WHERE project_id = ?
                 ORDER BY name COLLATE NOCASE
@@ -144,6 +150,7 @@ class AppRepository:
                 name=row["name"],
                 label_type=row["label_type"],
                 preview_image_path=row["preview_image_path"],
+                preview_definition=json.loads(row["preview_definition_json"]) if row["preview_definition_json"] else None,
             )
             for row in rows
         ]
@@ -251,7 +258,7 @@ class AppRepository:
         with self.database.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, image_id, label_template_id, label_name, label_type, is_visible, source, note
+                SELECT id, image_id, label_template_id, label_name, label_type, annotation_definition_json, is_visible, source, note
                 FROM annotations
                 WHERE image_id = ?
                 ORDER BY id DESC
@@ -266,6 +273,7 @@ class AppRepository:
                 label_template_id=row["label_template_id"],
                 label_name=row["label_name"],
                 label_type=row["label_type"],
+                annotation_definition=json.loads(row["annotation_definition_json"]) if row["annotation_definition_json"] else None,
                 is_visible=bool(row["is_visible"]),
                 source=row["source"],
                 note=row["note"],
@@ -273,12 +281,43 @@ class AppRepository:
             for row in rows
         ]
 
+    def list_annotations_for_task(self, task_id: int) -> dict[int, list[AnnotationRecord]]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT a.id, a.image_id, a.label_template_id, a.label_name, a.label_type, a.annotation_definition_json, a.is_visible, a.source, a.note
+                FROM annotations a
+                JOIN images i ON i.id = a.image_id
+                WHERE i.task_id = ? AND i.is_deleted = 0
+                ORDER BY a.image_id, a.id DESC
+                """,
+                (task_id,),
+            ).fetchall()
+
+        annotations_by_image: dict[int, list[AnnotationRecord]] = {}
+        for row in rows:
+            annotations_by_image.setdefault(row["image_id"], []).append(
+                AnnotationRecord(
+                    id=row["id"],
+                    image_id=row["image_id"],
+                    label_template_id=row["label_template_id"],
+                    label_name=row["label_name"],
+                    label_type=row["label_type"],
+                    annotation_definition=json.loads(row["annotation_definition_json"]) if row["annotation_definition_json"] else None,
+                    is_visible=bool(row["is_visible"]),
+                    source=row["source"],
+                    note=row["note"],
+                )
+            )
+        return annotations_by_image
+
     def add_annotation(
         self,
         image_id: int,
         label_template_id: int,
         label_name: str,
         label_type: str,
+        annotation_definition: dict[str, object] | None,
         source: str,
         note: str,
     ) -> None:
@@ -286,12 +325,61 @@ class AppRepository:
         with self.database.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO annotations(image_id, label_template_id, label_name, label_type, is_visible, source, note, created_at)
-                VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                INSERT INTO annotations(image_id, label_template_id, label_name, label_type, annotation_definition_json, is_visible, source, note, created_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
-                (image_id, label_template_id, label_name, label_type, source, note, timestamp),
+                (
+                    image_id,
+                    label_template_id,
+                    label_name,
+                    label_type,
+                    json.dumps(annotation_definition, ensure_ascii=False) if annotation_definition is not None else None,
+                    source,
+                    note,
+                    timestamp,
+                ),
             )
             self._touch_from_image(connection, image_id)
+
+    def get_annotation(self, annotation_id: int) -> AnnotationRecord | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, image_id, label_template_id, label_name, label_type, annotation_definition_json, is_visible, source, note
+                FROM annotations
+                WHERE id = ?
+                """,
+                (annotation_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return AnnotationRecord(
+            id=row["id"],
+            image_id=row["image_id"],
+            label_template_id=row["label_template_id"],
+            label_name=row["label_name"],
+            label_type=row["label_type"],
+            annotation_definition=json.loads(row["annotation_definition_json"]) if row["annotation_definition_json"] else None,
+            is_visible=bool(row["is_visible"]),
+            source=row["source"],
+            note=row["note"],
+        )
+
+    def update_annotation_definition(self, annotation_id: int, annotation_definition: dict[str, object] | None) -> None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT image_id FROM annotations WHERE id = ?",
+                (annotation_id,),
+            ).fetchone()
+            if row is None:
+                return
+            connection.execute(
+                "UPDATE annotations SET annotation_definition_json = ? WHERE id = ?",
+                (json.dumps(annotation_definition, ensure_ascii=False) if annotation_definition is not None else None, annotation_id),
+            )
+            self._touch_from_image(connection, row["image_id"])
 
     def toggle_annotation_visibility(self, annotation_id: int) -> None:
         with self.database.connect() as connection:
@@ -333,6 +421,22 @@ class AppRepository:
             )
             self._touch_task(connection, row["task_id"], timestamp)
 
+    def delete_project(self, project_id: int) -> None:
+        with self.database.connect() as connection:
+            connection.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+    def delete_task(self, task_id: int) -> None:
+        timestamp = self._now()
+        with self.database.connect() as connection:
+            row = connection.execute("SELECT project_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                return
+            connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            connection.execute(
+                "UPDATE projects SET updated_at = ? WHERE id = ?",
+                (timestamp, row["project_id"]),
+            )
+
     def merge_projects(self, source_project_id: int, target_project_id: int) -> None:
         if source_project_id == target_project_id:
             raise ValueError("Projekt zrodlowy i docelowy musza byc rozne.")
@@ -340,7 +444,7 @@ class AppRepository:
         timestamp = self._now()
         with self.database.connect() as connection:
             label_rows = connection.execute(
-                "SELECT name, label_type, preview_image_path FROM label_templates WHERE project_id = ?",
+                "SELECT name, label_type, preview_image_path, preview_definition_json FROM label_templates WHERE project_id = ?",
                 (source_project_id,),
             ).fetchall()
             existing_labels = {
@@ -356,10 +460,17 @@ class AppRepository:
                     continue
                 connection.execute(
                     """
-                    INSERT INTO label_templates(project_id, name, label_type, preview_image_path, created_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO label_templates(project_id, name, label_type, preview_image_path, preview_definition_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (target_project_id, row["name"], row["label_type"], row["preview_image_path"], timestamp),
+                    (
+                        target_project_id,
+                        row["name"],
+                        row["label_type"],
+                        row["preview_image_path"],
+                        row["preview_definition_json"],
+                        timestamp,
+                    ),
                 )
 
             task_rows = connection.execute(
@@ -420,7 +531,7 @@ class AppRepository:
             )
             annotation_rows = connection.execute(
                 """
-                SELECT label_template_id, label_name, label_type, is_visible, source, note, created_at
+                SELECT label_template_id, label_name, label_type, annotation_definition_json, is_visible, source, note, created_at
                 FROM annotations
                 WHERE image_id = ?
                 ORDER BY id
@@ -430,14 +541,15 @@ class AppRepository:
             for annotation_row in annotation_rows:
                 connection.execute(
                     """
-                    INSERT INTO annotations(image_id, label_template_id, label_name, label_type, is_visible, source, note, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO annotations(image_id, label_template_id, label_name, label_type, annotation_definition_json, is_visible, source, note, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_image_id,
                         annotation_row["label_template_id"],
                         annotation_row["label_name"],
                         annotation_row["label_type"],
+                        annotation_row["annotation_definition_json"],
                         annotation_row["is_visible"],
                         annotation_row["source"],
                         annotation_row["note"],
@@ -450,14 +562,24 @@ class AppRepository:
         with self.database.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO app_sessions(id, last_page, last_project_id, last_task_id, window_width, window_height, updated_at)
-                VALUES (1, ?, ?, ?, ?, ?, ?)
+                INSERT INTO app_sessions(
+                    id,
+                    last_page,
+                    last_project_id,
+                    last_task_id,
+                    window_width,
+                    window_height,
+                    last_model_config_json,
+                    updated_at
+                )
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     last_page = excluded.last_page,
                     last_project_id = excluded.last_project_id,
                     last_task_id = excluded.last_task_id,
                     window_width = excluded.window_width,
                     window_height = excluded.window_height,
+                    last_model_config_json = excluded.last_model_config_json,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -466,6 +588,7 @@ class AppRepository:
                     session.last_task_id,
                     session.window_width,
                     session.window_height,
+                    json.dumps(session.last_model_config, ensure_ascii=False) if session.last_model_config is not None else None,
                     timestamp,
                 ),
             )
@@ -473,7 +596,7 @@ class AppRepository:
     def load_session_state(self) -> SessionState:
         with self.database.connect() as connection:
             row = connection.execute(
-                "SELECT last_page, last_project_id, last_task_id, window_width, window_height FROM app_sessions WHERE id = 1"
+                "SELECT last_page, last_project_id, last_task_id, window_width, window_height, last_model_config_json FROM app_sessions WHERE id = 1"
             ).fetchone()
 
         if row is None:
@@ -485,6 +608,7 @@ class AppRepository:
             last_task_id=row["last_task_id"],
             window_width=row["window_width"],
             window_height=row["window_height"],
+            last_model_config=json.loads(row["last_model_config_json"]) if row["last_model_config_json"] else None,
         )
 
     def _touch_from_image(self, connection, image_id: int) -> None:

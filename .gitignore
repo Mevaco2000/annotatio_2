@@ -2,3 +2,5 @@ ARCHITECTURE_OVERVIEW.md
 README.md
 __pycache__/
 *.pyc
+exports/
+database/session_prefill_smoke.sqlite

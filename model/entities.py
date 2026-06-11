@@ -9,6 +9,7 @@ class LabelTemplate:
     name: str
     label_type: str
     preview_image_path: str | None = None
+    preview_definition: dict[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -21,6 +22,7 @@ class ProjectSummary:
     annotation_count: int
     updated_at: str
     preview_image_path: str | None
+    storage_path: str | None
 
 
 @dataclass(slots=True)
@@ -30,6 +32,7 @@ class ProjectDetails:
     project_type: str
     created_at: str
     updated_at: str
+    storage_path: str | None
 
 
 @dataclass(slots=True)
@@ -60,6 +63,7 @@ class AnnotationRecord:
     label_template_id: int | None
     label_name: str
     label_type: str
+    annotation_definition: dict[str, object] | None
     is_visible: bool
     source: str
     note: str | None
@@ -72,3 +76,4 @@ class SessionState:
     last_task_id: int | None = None
     window_width: int = 1400
     window_height: int = 900
+    last_model_config: dict[str, object] | None = None

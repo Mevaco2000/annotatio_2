@@ -24,6 +24,7 @@ class DatabaseManager:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
                     project_type TEXT NOT NULL,
+                    storage_path TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -34,6 +35,7 @@ class DatabaseManager:
                     name TEXT NOT NULL,
                     label_type TEXT NOT NULL,
                     preview_image_path TEXT,
+                    preview_definition_json TEXT,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
                 );
@@ -64,6 +66,7 @@ class DatabaseManager:
                     label_template_id INTEGER,
                     label_name TEXT NOT NULL,
                     label_type TEXT NOT NULL,
+                    annotation_definition_json TEXT,
                     is_visible INTEGER NOT NULL DEFAULT 1,
                     source TEXT NOT NULL,
                     note TEXT,
@@ -79,7 +82,17 @@ class DatabaseManager:
                     last_task_id INTEGER,
                     window_width INTEGER NOT NULL,
                     window_height INTEGER NOT NULL,
+                    last_model_config_json TEXT,
                     updated_at TEXT NOT NULL
                 );
                 """
             )
+            self._ensure_column(connection, "projects", "storage_path", "TEXT")
+            self._ensure_column(connection, "label_templates", "preview_definition_json", "TEXT")
+            self._ensure_column(connection, "annotations", "annotation_definition_json", "TEXT")
+            self._ensure_column(connection, "app_sessions", "last_model_config_json", "TEXT")
+
+    def _ensure_column(self, connection: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
+        columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()}
+        if column_name not in columns:
+            connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
