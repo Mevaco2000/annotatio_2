@@ -15,10 +15,15 @@ except ImportError:
 
 
 class AppView(tk.Tk):
+    SIDEBAR_EXPANDED_WIDTH = 180
+    SIDEBAR_COLLAPSED_WIDTH = 64
+    TITLEBAR_HEIGHT = 42
+
     def __init__(self) -> None:
         super().__init__()
-        self.title("Annotatio")
+        self.title("annotat.io")
         self.minsize(1200, 800)
+        self.configure(background="#0f172a")
 
         self._nav_callback = None
         self._create_project_callback = None
@@ -37,6 +42,7 @@ class AppView(tk.Tk):
         self._delete_annotation_callback = None
         self._delete_image_callback = None
         self._auto_label_callback = None
+        self._auto_label_task_callback = None
         self._run_last_model_callback = None
         self._copy_previous_annotation_callback = None
         self._change_image_callback = None
@@ -65,15 +71,29 @@ class AppView(tk.Tk):
         self._task_editing_annotation_id: int | None = None
         self._task_selected_draft_point_index: int | None = None
         self._task_dragging_draft_point = False
+        self._task_dragging_new_bbox = False
         self._task_status_var: tk.StringVar | None = None
         self._task_template_info_var: tk.StringVar | None = None
         self._task_template_preview_holder: ttk.Frame | None = None
         self._task_annotation_canvas: tk.Canvas | None = None
         self._task_annotation_image_item: int | None = None
         self._task_submit_button: ttk.Button | None = None
+        self._sidebar_expanded = True
+        self._sidebar_title_label: ttk.Label | None = None
+        self._sidebar_toggle_button: ttk.Button | None = None
+        self._sidebar_nav_buttons: list[tuple[ttk.Button, str, str]] = []
+        self._title_bar: tk.Frame | None = None
+        self._title_bar_label: tk.Label | None = None
+        self._minimize_button: tk.Button | None = None
+        self._maximize_button: tk.Button | None = None
+        self._close_button: tk.Button | None = None
+        self._window_close_callback = None
+        self._window_drag_offset: tuple[int, int] | None = None
+        self._window_restore_geometry: str | None = None
 
         self._configure_style()
         self._build_shell()
+        self._install_custom_window_chrome()
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
@@ -82,6 +102,8 @@ class AppView(tk.Tk):
         style.configure("Sidebar.TFrame", background="#1f2937")
         style.configure("Sidebar.TButton", background="#1f2937", foreground="#f9fafb", padding=10)
         style.map("Sidebar.TButton", background=[("active", "#374151")])
+        style.configure("SidebarToggle.TButton", background="#1f2937", foreground="#f9fafb", padding=6)
+        style.map("SidebarToggle.TButton", background=[("active", "#374151")])
         style.configure("Card.TFrame", background="#f8fafc", relief="solid", borderwidth=1)
         style.configure("SelectedCard.TFrame", background="#e0f2fe", relief="solid", borderwidth=2)
         style.configure("Preview.TFrame", background="#f8fafc", relief="flat", borderwidth=0)
@@ -96,35 +118,227 @@ class AppView(tk.Tk):
         style.configure("SelectedCardMuted.TLabel", background="#e0f2fe", foreground="#0f172a")
 
     def _build_shell(self) -> None:
-        self.columnconfigure(1, weight=1)
-        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
 
-        self.sidebar = ttk.Frame(self, style="Sidebar.TFrame", width=180)
+        self._title_bar = tk.Frame(self, bg="#0f172a", height=self.TITLEBAR_HEIGHT, highlightthickness=0, bd=0)
+        self._title_bar.grid(row=0, column=0, sticky="ew")
+        self._title_bar.grid_propagate(False)
+        self._title_bar.columnconfigure(0, weight=1)
+
+        title_container = tk.Frame(self._title_bar, bg="#0f172a", highlightthickness=0, bd=0)
+        title_container.grid(row=0, column=0, sticky="ew")
+        title_container.columnconfigure(0, weight=1)
+
+        self._title_bar_label = tk.Label(
+            title_container,
+            text="annotat.io",
+            bg="#0f172a",
+            fg="#f8fafc",
+            padx=16,
+            pady=10,
+            anchor="w",
+            font=("Segoe UI", 11, "bold"),
+        )
+        self._title_bar_label.grid(row=0, column=0, sticky="ew")
+
+        window_buttons = tk.Frame(title_container, bg="#0f172a", highlightthickness=0, bd=0)
+        window_buttons.grid(row=0, column=1, sticky="e")
+
+        self._minimize_button = tk.Button(
+            window_buttons,
+            text="_",
+            command=self._minimize_window,
+            bg="#0f172a",
+            fg="#f8fafc",
+            activebackground="#1e293b",
+            activeforeground="#f8fafc",
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=8,
+            highlightthickness=0,
+        )
+        self._minimize_button.grid(row=0, column=0)
+
+        self._maximize_button = tk.Button(
+            window_buttons,
+            text="[]",
+            command=self._toggle_maximize_window,
+            bg="#0f172a",
+            fg="#f8fafc",
+            activebackground="#1e293b",
+            activeforeground="#f8fafc",
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=8,
+            highlightthickness=0,
+        )
+        self._maximize_button.grid(row=0, column=1)
+
+        self._close_button = tk.Button(
+            window_buttons,
+            text="X",
+            command=self._handle_window_close,
+            bg="#0f172a",
+            fg="#f8fafc",
+            activebackground="#dc2626",
+            activeforeground="#f8fafc",
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=8,
+            highlightthickness=0,
+        )
+        self._close_button.grid(row=0, column=2)
+
+        self._window_body = ttk.Frame(self)
+        self._window_body.grid(row=1, column=0, sticky="nsew")
+        self._window_body.columnconfigure(1, weight=1)
+        self._window_body.rowconfigure(0, weight=1)
+
+        self.sidebar = ttk.Frame(self._window_body, style="Sidebar.TFrame", width=self.SIDEBAR_EXPANDED_WIDTH)
         self.sidebar.grid(row=0, column=0, sticky="ns")
         self.sidebar.grid_propagate(False)
         self.sidebar.columnconfigure(0, weight=1)
 
-        title = ttk.Label(self.sidebar, text="Annotatio", foreground="#f9fafb", background="#1f2937", font=("Segoe UI", 20, "bold"))
-        title.grid(row=0, column=0, sticky="ew", padx=16, pady=(20, 24))
+        sidebar_header = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
+        sidebar_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(16, 20))
+        sidebar_header.columnconfigure(0, weight=1)
+
+        self._sidebar_toggle_button = ttk.Button(
+            sidebar_header,
+            text="<<",
+            style="SidebarToggle.TButton",
+            width=3,
+            command=self._toggle_sidebar,
+        )
+        self._sidebar_toggle_button.grid(row=0, column=0, sticky="e")
 
         nav_items = [
             ("Start", "home"),
             ("Projects", "projects"),
             ("Settings", "settings"),
+            ("Weryfikacja annotacji", "labels-checks"),
+            ("Dokumentacja", "info"),
             ("Info", "info"),
         ]
         for index, (label, page_name) in enumerate(nav_items, start=1):
-            ttk.Button(
+            collapsed_label = {
+                "Start": "St",
+                "Projects": "Pr",
+                "Settings": "Se",
+                "Weryfikacja annotacji": "Wa",
+                "Dokumentacja": "Do",
+                "Info": "In",
+            }.get(label, label[:2])
+            button = ttk.Button(
                 self.sidebar,
                 text=label,
                 style="Sidebar.TButton",
                 command=lambda value=page_name: self._nav_callback and self._nav_callback(value),
-            ).grid(row=index, column=0, sticky="ew", padx=12, pady=4)
+            )
+            button.grid(row=index, column=0, sticky="ew", padx=12, pady=4)
+            self._sidebar_nav_buttons.append((button, label, collapsed_label))
 
-        self.content = ttk.Frame(self, padding=20)
+        self.content = ttk.Frame(self._window_body, padding=20)
         self.content.grid(row=0, column=1, sticky="nsew")
         self.content.columnconfigure(0, weight=1)
         self.content.rowconfigure(0, weight=1)
+        self._apply_sidebar_state()
+
+    def _install_custom_window_chrome(self) -> None:
+        self.overrideredirect(True)
+        self.bind("<Map>", self._on_window_map)
+        self.bind("<Escape>", self._on_escape_restore)
+        if self._title_bar is not None:
+            self._bind_title_bar_drag(self._title_bar)
+        if self._title_bar_label is not None:
+            self._bind_title_bar_drag(self._title_bar_label)
+
+    def _bind_title_bar_drag(self, widget: tk.Widget) -> None:
+        widget.bind("<ButtonPress-1>", self._on_title_bar_press)
+        widget.bind("<B1-Motion>", self._on_title_bar_drag)
+        widget.bind("<Double-Button-1>", lambda _event: self._toggle_maximize_window())
+
+    def _on_title_bar_press(self, event: tk.Event) -> None:
+        if self.state() == "zoomed":
+            self._window_drag_offset = None
+            return
+        self._window_drag_offset = (int(event.x_root - self.winfo_x()), int(event.y_root - self.winfo_y()))
+
+    def _on_title_bar_drag(self, event: tk.Event) -> None:
+        if self.state() == "zoomed" or self._window_drag_offset is None:
+            return
+        offset_x, offset_y = self._window_drag_offset
+        new_x = int(event.x_root - offset_x)
+        new_y = int(event.y_root - offset_y)
+        self.geometry(f"+{new_x}+{new_y}")
+
+    def _minimize_window(self) -> None:
+        self.overrideredirect(False)
+        self.iconify()
+
+    def _toggle_maximize_window(self) -> None:
+        if self.state() == "zoomed":
+            self.state("normal")
+            if self._window_restore_geometry is not None:
+                self.geometry(self._window_restore_geometry)
+        else:
+            self._window_restore_geometry = self.geometry()
+            self.state("zoomed")
+        self._update_title_bar_buttons()
+
+    def _on_escape_restore(self, _event: tk.Event | None = None) -> str | None:
+        if self.state() == "zoomed":
+            self._toggle_maximize_window()
+            return "break"
+        return None
+
+    def _on_window_map(self, _event: tk.Event) -> None:
+        if self.state() != "iconic":
+            self.after_idle(self._restore_custom_window_chrome)
+        self._update_title_bar_buttons()
+
+    def _restore_custom_window_chrome(self) -> None:
+        try:
+            self.overrideredirect(True)
+        except tk.TclError:
+            return
+
+    def _update_title_bar_buttons(self) -> None:
+        if self._maximize_button is None:
+            return
+        self._maximize_button.configure(text="[]" if self.state() != "zoomed" else "<>" )
+
+    def _handle_window_close(self) -> None:
+        if self._window_close_callback is not None:
+            self._window_close_callback()
+            return
+        self.destroy()
+
+    def _toggle_sidebar(self) -> None:
+        self._sidebar_expanded = not self._sidebar_expanded
+        self._apply_sidebar_state()
+
+    def _apply_sidebar_state(self) -> None:
+        sidebar_width = self.SIDEBAR_EXPANDED_WIDTH if self._sidebar_expanded else self.SIDEBAR_COLLAPSED_WIDTH
+        self.sidebar.configure(width=sidebar_width)
+
+        if self._sidebar_title_label is not None:
+            if self._sidebar_expanded:
+                self._sidebar_title_label.grid()
+            else:
+                self._sidebar_title_label.grid_remove()
+
+        if self._sidebar_toggle_button is not None:
+            self._sidebar_toggle_button.configure(text="<<" if self._sidebar_expanded else ">>")
+
+        for button, expanded_label, collapsed_label in self._sidebar_nav_buttons:
+            button.configure(text=expanded_label if self._sidebar_expanded else collapsed_label)
+
+        self.sidebar.update_idletasks()
 
     def apply_session_state(self, session: SessionState) -> None:
         self.geometry(f"{session.window_width}x{session.window_height}")
@@ -180,6 +394,9 @@ class AppView(tk.Tk):
     def set_auto_label_callback(self, callback) -> None:
         self._auto_label_callback = callback
 
+    def set_auto_label_task_callback(self, callback) -> None:
+        self._auto_label_task_callback = callback
+
     def set_run_last_model_callback(self, callback) -> None:
         self._run_last_model_callback = callback
 
@@ -190,6 +407,7 @@ class AppView(tk.Tk):
         self._change_image_callback = callback
 
     def set_close_callback(self, callback) -> None:
+        self._window_close_callback = callback
         self.protocol("WM_DELETE_WINDOW", callback)
 
     def get_selected_project_id(self) -> int | None:
@@ -391,7 +609,8 @@ class AppView(tk.Tk):
         ttk.Button(toolbar, text="Powrot do projektu", command=lambda: self._open_project(project.id)).pack(side="left")
         ttk.Button(toolbar, text="Usun zdjecie z datasetu", command=self._delete_image_callback).pack(side="left", padx=(8, 0))
         ttk.Button(toolbar, text="Uruchom ostatni model", command=self._run_last_model_callback).pack(side="right")
-        ttk.Button(toolbar, text="Dodaj label przy uzyciu modelu", command=self._auto_label_callback).pack(side="right")
+        ttk.Button(toolbar, text="Autolabel caly task", command=self._auto_label_task_callback).pack(side="right", padx=(8, 0))
+        ttk.Button(toolbar, text="Dodaj label przy uzyciu modelu", command=self._auto_label_callback).pack(side="right", padx=(8, 0))
 
         counter_text = "0/0"
         current_image = None
@@ -409,6 +628,7 @@ class AppView(tk.Tk):
         self._task_annotations_by_id = {item.id: item for item in current_annotations}
         self._task_current_image_path = current_image.file_path if current_image else None
         self._task_current_draft_points = []
+        supports_keypoint_annotations = any(item.label_type in {"Point", "Skeleton"} for item in label_templates)
         available_annotation_ids = set(self._task_annotations_by_id)
         if self._task_selected_annotation_id not in available_annotation_ids:
             self._task_selected_annotation_id = None
@@ -445,11 +665,12 @@ class AppView(tk.Tk):
             command=self._handle_task_annotation_submit,
         )
         self._task_submit_button.pack(side="right", padx=(8, 0))
-        ttk.Button(
-            controls,
-            text="Ukryj/Odkryj keypoint",
-            command=self._toggle_selected_task_keypoint_visibility,
-        ).pack(side="right", padx=(8, 0))
+        if supports_keypoint_annotations:
+            ttk.Button(
+                controls,
+                text="Ukryj/Odkryj keypoint",
+                command=self._toggle_selected_task_keypoint_visibility,
+            ).pack(side="right", padx=(8, 0))
         ttk.Button(
             controls,
             text="Skopiuj z poprzedniego zdjecia",
@@ -530,13 +751,19 @@ class AppView(tk.Tk):
 
         button_row = ttk.Frame(right_panel)
         button_row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(button_row, text="Zmien polozenie keypointow", command=lambda: self._start_selected_annotation_reposition(tree)).pack(side="left")
+        if supports_keypoint_annotations:
+            ttk.Button(button_row, text="Zmien polozenie keypointow", command=lambda: self._start_selected_annotation_reposition(tree)).pack(side="left")
         ttk.Button(button_row, text="Ukryj/Pokaz", command=lambda: self._toggle_selected_annotation(tree)).pack(side="left")
         ttk.Button(button_row, text="Usun label", command=lambda: self._delete_selected_annotation(tree)).pack(side="left", padx=(8, 0))
 
     def show_settings_page(self, description: str) -> None:
         frame = self._reset_content()
         ttk.Label(frame, text="Settings", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, text=description, justify="left", wraplength=820).grid(row=1, column=0, sticky="nw", pady=(16, 0))
+
+    def show_labels_checks_page(self, description: str) -> None:
+        frame = self._reset_content()
+        ttk.Label(frame, text="Weryfikacja annotacji", style="Header.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(frame, text=description, justify="left", wraplength=820).grid(row=1, column=0, sticky="nw", pady=(16, 0))
 
     def show_info_page(self, description: str) -> None:
@@ -692,7 +919,7 @@ class AppView(tk.Tk):
         current_points = len(self._task_current_draft_points)
         visible_points = sum(1 for point in self._task_current_draft_points if self._get_task_point_visibility(point) > 0)
         if label_template.label_type == "Bounding box":
-            return f"Kliknij dwa rogi boxa na aktualnym obrazie. Postep: {current_points}/2."
+            return "Nacisnij i przeciagnij myszka, aby narysowac bounding box na aktualnym obrazie."
         if label_template.label_type == "Point":
             return f"Kliknij punkt na aktualnym obrazie. Możesz go potem przeciągnąć lub ukryć. Postep: {current_points}/1. Widoczne: {visible_points}."
         if label_template.label_type == "Skeleton":
@@ -844,15 +1071,30 @@ class AppView(tk.Tk):
         return "break"
 
     def _on_task_image_press(self, event: tk.Event) -> None:
+        label_id = self._resolve_task_label_id(self.task_label_var.get() if hasattr(self, "task_label_var") else "")
+        label_template = self._task_label_templates_by_id.get(label_id)
         canvas_x, canvas_y = self._get_task_canvas_event_coords(event)
         point_index = self._find_task_draft_point_index(canvas_x, canvas_y)
         if point_index is not None:
             self._task_selected_draft_point_index = point_index
             self._task_dragging_draft_point = False
+            self._task_dragging_new_bbox = False
             self._render_task_annotation_overlay()
             return
         self._task_selected_draft_point_index = None
         self._task_dragging_draft_point = False
+        self._task_dragging_new_bbox = False
+        if label_template is not None and label_template.label_type == "Bounding box" and self._task_editing_annotation_id is None:
+            point = self._to_task_normalized_point(canvas_x, canvas_y)
+            if point is None:
+                return
+            cloned_point = self._clone_task_point(point)
+            self._task_current_draft_points = [cloned_point, self._clone_task_point(point)]
+            self._task_dragging_new_bbox = True
+            self._render_task_annotation_overlay()
+            if self._task_status_var is not None:
+                self._task_status_var.set("Przeciagaj myszka, aby okreslic przeciwlegly rog bounding boxa.")
+            return
         self._on_task_image_click(event)
 
     def _on_task_image_click(self, event: tk.Event) -> None:
@@ -884,10 +1126,9 @@ class AppView(tk.Tk):
         if label_template.label_type == "Point":
             self._task_current_draft_points = [self._clone_task_point(point)]
         elif label_template.label_type == "Bounding box":
-            if len(self._task_current_draft_points) >= 2:
-                self._task_current_draft_points = [self._clone_task_point(point)]
-            else:
-                self._task_current_draft_points.append(self._clone_task_point(point))
+            if self._task_status_var is not None:
+                self._task_status_var.set("Bounding box rysuje sie przez przeciaganie myszka na obrazie.")
+            return
         else:
             if label_template.label_type == "Skeleton" and template_points and len(self._task_current_draft_points) >= len(template_points):
                 if self._task_status_var is not None:
@@ -907,6 +1148,22 @@ class AppView(tk.Tk):
             )
 
     def _on_task_image_drag(self, event: tk.Event) -> None:
+        if self._task_dragging_new_bbox:
+            if len(self._task_current_draft_points) < 2:
+                self._task_dragging_new_bbox = False
+                return
+            canvas_x, canvas_y = self._get_task_canvas_event_coords(event)
+            point = self._to_task_normalized_point(canvas_x, canvas_y)
+            if point is None:
+                return
+            first_point = self._task_current_draft_points[0]
+            self._task_current_draft_points = [
+                self._clone_task_point(first_point, visibility=self._get_task_point_visibility(first_point)),
+                self._clone_task_point(point),
+            ]
+            self._render_task_annotation_overlay()
+            return
+
         point_index = self._task_selected_draft_point_index
         if point_index is None:
             return
@@ -925,6 +1182,26 @@ class AppView(tk.Tk):
         self._render_task_annotation_overlay()
 
     def _on_task_image_release(self, _event: tk.Event) -> None:
+        if self._task_dragging_new_bbox:
+            self._task_dragging_new_bbox = False
+            if len(self._task_current_draft_points) >= 2:
+                start_point = self._task_current_draft_points[0]
+                end_point = self._task_current_draft_points[1]
+                if start_point["x"] == end_point["x"] and start_point["y"] == end_point["y"]:
+                    self._task_current_draft_points = []
+                    label_id = self._resolve_task_label_id(self.task_label_var.get() if hasattr(self, "task_label_var") else "")
+                    label_template = self._task_label_templates_by_id.get(label_id)
+                    if label_template is not None and self._task_status_var is not None:
+                        self._task_status_var.set(self._describe_task_draft_state(label_template, label_template.preview_definition))
+                    self._render_task_annotation_overlay()
+                    return
+                self._render_task_annotation_overlay()
+                self._submit_annotation(
+                    self.task_label_var.get() if hasattr(self, "task_label_var") else "",
+                    "",
+                    self._build_task_annotation_definition(),
+                )
+            return
         if self._task_selected_draft_point_index is None:
             return
         self._task_dragging_draft_point = False
@@ -933,9 +1210,22 @@ class AppView(tk.Tk):
     def _undo_task_annotation_point(self) -> None:
         if not self._task_current_draft_points:
             return
+        if len(self._task_current_draft_points) == 2:
+            label_id = self._resolve_task_label_id(self.task_label_var.get() if hasattr(self, "task_label_var") else "")
+            label_template = self._task_label_templates_by_id.get(label_id)
+            if label_template is not None and label_template.label_type == "Bounding box":
+                self._task_current_draft_points = []
+                self._task_selected_draft_point_index = None
+                self._task_dragging_draft_point = False
+                self._task_dragging_new_bbox = False
+                self._render_task_annotation_overlay()
+                if self._task_status_var is not None:
+                    self._task_status_var.set(self._describe_task_draft_state(label_template, label_template.preview_definition))
+                return
         self._task_current_draft_points.pop()
         self._task_selected_draft_point_index = None
         self._task_dragging_draft_point = False
+        self._task_dragging_new_bbox = False
         self._render_task_annotation_overlay()
         label_id = self._resolve_task_label_id(self.task_label_var.get() if hasattr(self, "task_label_var") else "")
         label_template = self._task_label_templates_by_id.get(label_id)
@@ -947,6 +1237,7 @@ class AppView(tk.Tk):
         self._task_editing_annotation_id = None
         self._task_selected_draft_point_index = None
         self._task_dragging_draft_point = False
+        self._task_dragging_new_bbox = False
         self._refresh_task_submit_button()
         self._render_task_annotation_overlay()
         label_id = self._resolve_task_label_id(self.task_label_var.get() if hasattr(self, "task_label_var") else "")
@@ -1290,6 +1581,7 @@ class AppView(tk.Tk):
         self._task_editing_annotation_id = annotation_id
         self._task_selected_draft_point_index = None
         self._task_dragging_draft_point = False
+        self._task_dragging_new_bbox = False
         self._refresh_task_submit_button()
         self._render_task_annotation_overlay()
         if self._task_status_var is not None:
@@ -1355,6 +1647,7 @@ class AppView(tk.Tk):
         self._task_editing_annotation_id = None
         self._task_selected_draft_point_index = None
         self._task_dragging_draft_point = False
+        self._task_dragging_new_bbox = False
         self._task_image_render_box = None
         self._task_image_photo = None
         self._task_annotation_image_item = None

@@ -450,6 +450,7 @@ class CreateProjectDialog(BaseDialog):
         self.labels: list[dict[str, str | None]] = []
         self._preview_points: list[dict[str, float]] = []
         self._preview_box: tuple[float, float, float, float] | None = None
+        self._preview_dragging_bbox = False
         self._preview_photo = None
         self._scroll_canvas: tk.Canvas | None = None
         self._scroll_window_id: int | None = None
@@ -556,7 +557,9 @@ class CreateProjectDialog(BaseDialog):
             cursor="crosshair",
         )
         self.preview_canvas.grid(row=13, column=0, columnspan=2, sticky="nsew")
-        self.preview_canvas.bind("<Button-1>", self._on_preview_canvas_click)
+        self.preview_canvas.bind("<ButtonPress-1>", self._on_preview_canvas_press)
+        self.preview_canvas.bind("<B1-Motion>", self._on_preview_canvas_drag)
+        self.preview_canvas.bind("<ButtonRelease-1>", self._on_preview_canvas_release)
 
         self.preview_status_label = ttk.Label(
             container,
@@ -683,12 +686,14 @@ class CreateProjectDialog(BaseDialog):
 
     def _on_preview_type_changed(self, *_args) -> None:
         self._preview_points = []
+        self._preview_dragging_bbox = False
         self._update_preview_tools()
         self._update_preview_status()
         self._refresh_preview_canvas()
 
     def _on_preview_source_changed(self, *_args) -> None:
         self._preview_points = []
+        self._preview_dragging_bbox = False
         self._update_preview_status()
         self._refresh_preview_canvas()
 
@@ -796,6 +801,21 @@ class CreateProjectDialog(BaseDialog):
             if label_type == "Skeleton":
                 self.preview_canvas.create_text(x_pos + 10, y_pos - 10, text=str(index), fill="#ffffff", anchor="w")
 
+    def _on_preview_canvas_press(self, event: tk.Event) -> None:
+        point = self._to_normalized_point(event.x, event.y)
+        if point is None:
+            return
+
+        label_type = self.label_type_var.get()
+        if label_type == "Bounding box":
+            self._preview_points = [point, dict(point)]
+            self._preview_dragging_bbox = True
+            self.preview_status_var.set("Przeciagaj myszka, aby okreslic przeciwlegly rog bounding boxa.")
+            self._refresh_preview_canvas()
+            return
+
+        self._on_preview_canvas_click(event)
+
     def _on_preview_canvas_click(self, event: tk.Event) -> None:
         point = self._to_normalized_point(event.x, event.y)
         if point is None:
@@ -809,10 +829,8 @@ class CreateProjectDialog(BaseDialog):
         if label_type == "Point":
             self._preview_points = [point]
         elif label_type == "Bounding box":
-            if len(self._preview_points) >= 2:
-                self._preview_points = [point]
-            else:
-                self._preview_points.append(point)
+            self.preview_status_var.set("Bounding box rysuje sie przez przeciaganie myszka na podgladzie.")
+            return
         else:
             if label_type == "Skeleton" and len(self._preview_points) >= self._get_skeleton_point_count():
                 self.preview_status_var.set("Skeleton ma już komplet punktów. Użyj Cofnij albo Wyczyść szkic.")
@@ -822,15 +840,44 @@ class CreateProjectDialog(BaseDialog):
         self._update_preview_status()
         self._refresh_preview_canvas()
 
+    def _on_preview_canvas_drag(self, event: tk.Event) -> None:
+        if not self._preview_dragging_bbox or len(self._preview_points) < 2:
+            return
+        point = self._to_normalized_point(event.x, event.y)
+        if point is None:
+            return
+        self._preview_points[1] = point
+        self._refresh_preview_canvas()
+
+    def _on_preview_canvas_release(self, _event: tk.Event) -> None:
+        if not self._preview_dragging_bbox:
+            return
+        self._preview_dragging_bbox = False
+        if len(self._preview_points) >= 2:
+            start_point = self._preview_points[0]
+            end_point = self._preview_points[1]
+            if start_point["x"] == end_point["x"] and start_point["y"] == end_point["y"]:
+                self._preview_points = []
+        self._update_preview_status()
+        self._refresh_preview_canvas()
+
     def _undo_preview_step(self) -> None:
         if not self._preview_points:
             return
+        if self.label_type_var.get() == "Bounding box" and len(self._preview_points) == 2:
+            self._preview_points = []
+            self._preview_dragging_bbox = False
+            self._update_preview_status()
+            self._refresh_preview_canvas()
+            return
         self._preview_points.pop()
+        self._preview_dragging_bbox = False
         self._update_preview_status()
         self._refresh_preview_canvas()
 
     def _clear_preview_definition(self) -> None:
         self._preview_points = []
+        self._preview_dragging_bbox = False
         self._update_preview_status()
         self._refresh_preview_canvas()
 
@@ -872,7 +919,7 @@ class CreateProjectDialog(BaseDialog):
             self.preview_status_var.set(f"Klikaj kolejne punkty skeletonu: {point_count}/{expected}.")
             return
         if label_type == "Bounding box":
-            self.preview_status_var.set("Kliknij dwa przeciwległe rogi bounding boxa na obrazie.")
+            self.preview_status_var.set("Nacisnij i przeciagnij myszka, aby narysowac bounding box na obrazie.")
             return
         if label_type in {"Polygon", "Segmentacja (maska)"}:
             self.preview_status_var.set(f"Klikaj wierzchołki obszaru. Aktualnie: {point_count} punktów.")
@@ -916,7 +963,7 @@ class CreateProjectDialog(BaseDialog):
         if label_type == "Skeleton" and point_count != self._get_skeleton_point_count():
             return f"Skeleton musi mieć dokładnie {self._get_skeleton_point_count()} punktów."
         if label_type == "Bounding box" and point_count != 2:
-            return "Bounding box wymaga dwóch kliknięć: lewy-górny i prawy-dolny róg."
+            return "Bounding box wymaga przeciagniecia myszka od jednego rogu do przeciwleglego."
         if label_type == "Point" and point_count != 1:
             return "Typ Point wymaga dokładnie jednego punktu."
         if label_type == "Polyline" and point_count < 2:
@@ -1098,6 +1145,51 @@ class ExportDatasetDialog(BaseDialog):
         self.destroy()
 
 
+class BatchProgressDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, title: str, total_steps: int) -> None:
+        super().__init__(parent)
+        self.title(title)
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.columnconfigure(0, weight=1)
+
+        self.total_steps = max(1, int(total_steps))
+        self.status_var = tk.StringVar(value="Przygotowanie autolabelingu...")
+        self.counter_var = tk.StringVar(value=f"0 / {self.total_steps}")
+        self.details_var = tk.StringVar(value="")
+
+        body = ttk.Frame(self, padding=18)
+        body.grid(sticky="nsew")
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(body, textvariable=self.status_var, justify="left", wraplength=420).grid(row=0, column=0, sticky="w")
+        self.progress = ttk.Progressbar(body, mode="determinate", maximum=self.total_steps, value=0, length=420)
+        self.progress.grid(row=1, column=0, sticky="ew", pady=(12, 8))
+        ttk.Label(body, textvariable=self.counter_var).grid(row=2, column=0, sticky="w")
+        ttk.Label(body, textvariable=self.details_var, justify="left", wraplength=420).grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+        self._refresh()
+
+    def update_progress(self, completed_steps: int, current_image_name: str, total_annotations: int) -> None:
+        bounded_steps = max(0, min(int(completed_steps), self.total_steps))
+        self.progress.configure(value=bounded_steps)
+        self.status_var.set(f"Autolabeling obrazu {bounded_steps}/{self.total_steps}: {current_image_name}")
+        self.counter_var.set(f"{bounded_steps} / {self.total_steps}")
+        self.details_var.set(f"Dodane annotacje lacznie: {total_annotations}")
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self.update_idletasks()
+        self.update()
+
+    def close(self) -> None:
+        if self.winfo_exists():
+            self.grab_release()
+            self.destroy()
+
+
 class ModelInferenceDialog(BaseDialog):
     MODE_DEFAULTS = {
         "Klasyfikacja": {"input_width": 224, "input_height": 224, "confidence": 0.25, "iou": 0.45},
@@ -1127,7 +1219,7 @@ class ModelInferenceDialog(BaseDialog):
         self.confidence_var = tk.DoubleVar(value=float(initial_config.get("confidence_threshold") or defaults["confidence"]))
         self.iou_var = tk.DoubleVar(value=float(initial_config.get("iou_threshold") or defaults["iou"]))
         self.summary_var = tk.StringVar(
-            value="Wybierz model .onnx albo .pt/.pth/.ts/.jit/.ckpt. Plik klas jest opcjonalny - bez niego zostanie uzyta kolejnosc etykiet projektu."
+            value="Wybierz model .onnx, .pt/.pth/.ts/.jit/.ckpt albo TensorFlow (.h5/.keras/.tflite lub katalog SavedModel). Plik klas jest opcjonalny - bez niego zostanie uzyta kolejnosc etykiet projektu."
         )
         self._build()
         self.model_path_var.trace_add("write", self._on_model_path_changed)
@@ -1202,7 +1294,7 @@ class ModelInferenceDialog(BaseDialog):
         selected = filedialog.askopenfilename(
             parent=self,
             title="Wybierz model",
-            filetypes=[("Modele inferencyjne", "*.onnx *.pt *.pth *.ts *.jit *.ckpt *.torchscript"), ("Wszystkie", "*.*")],
+            filetypes=[("Modele inferencyjne", "*.onnx *.pt *.pth *.ts *.jit *.ckpt *.torchscript *.h5 *.keras *.tflite"), ("Wszystkie", "*.*")],
         )
         if selected:
             self.model_path_var.set(selected)

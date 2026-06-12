@@ -7,6 +7,7 @@ from database.repositories import AppRepository
 from database.sqlite_db import DatabaseManager
 from gui.app_view import AppView
 from gui.dialogs import (
+    BatchProgressDialog,
     CreateProjectDialog,
     CreateTaskDialog,
     ExportDialog,
@@ -14,6 +15,7 @@ from gui.dialogs import (
     ModelInferenceDialog,
 )
 from model.entities import LabelTemplate, SessionState
+from model.labels_checks_service import LabelsChecksService
 from model.services import AppService
 
 
@@ -25,6 +27,7 @@ class AppController:
         self.database = DatabaseManager(database_path)
         self.repository = AppRepository(self.database)
         self.service = AppService(self.repository, self.root_dir / "projects")
+        self.labels_checks_service = LabelsChecksService()
         self.view = AppView()
 
         self.current_page = "home"
@@ -64,6 +67,7 @@ class AppController:
         self.view.set_delete_annotation_callback(self.delete_annotation)
         self.view.set_delete_image_callback(self.delete_current_image)
         self.view.set_auto_label_callback(self.auto_label_current_image)
+        self.view.set_auto_label_task_callback(self.auto_label_task_images)
         self.view.set_run_last_model_callback(self.run_last_model_for_current_image)
         self.view.set_copy_previous_annotation_callback(self.copy_annotation_from_previous_image)
         self.view.set_change_image_callback(self.change_image)
@@ -81,6 +85,8 @@ class AppController:
             self.show_projects_page()
         elif self.session_state.last_page == "settings":
             self.show_settings_page()
+        elif self.session_state.last_page == "labels-checks":
+            self.show_labels_checks_page()
         elif self.session_state.last_page == "info":
             self.show_info_page()
         else:
@@ -139,33 +145,68 @@ class AppController:
 
         return workspace, images, available_modes
 
-    def _run_auto_label_payload(self, workspace: dict, images: list, payload: dict[str, object], save_as_last_used: bool = True) -> None:
+    def _run_auto_label_payload(
+        self,
+        workspace: dict,
+        images: list,
+        payload: dict[str, object],
+        save_as_last_used: bool = True,
+        target_image_indexes: list[int] | None = None,
+    ) -> None:
         if save_as_last_used:
             self.session_state.last_model_config = dict(payload)
             self._save_session_state()
 
-        image_id = images[self.current_image_index].id
+        indexes = list(target_image_indexes) if target_image_indexes is not None else [self.current_image_index]
+        total_added_count = 0
+        progress_dialog = BatchProgressDialog(self.view, "Autolabeling taska", len(indexes)) if len(indexes) > 1 else None
         try:
-            added_count = self.service.auto_label_image(
-                image_id=image_id,
-                image_path=images[self.current_image_index].file_path,
-                project_type=workspace["project"].project_type,
-                project_labels=workspace["labels"],
-                config=payload,
-            )
-        except ValueError as error:
-            messagebox.showerror("Model", str(error), parent=self.view)
-            return
+            for progress_index, image_index in enumerate(indexes, start=1):
+                image_record = images[image_index]
+                image_name = Path(image_record.file_path).name
+                try:
+                    total_added_count += self.service.auto_label_image(
+                        image_id=image_record.id,
+                        image_path=image_record.file_path,
+                        project_type=workspace["project"].project_type,
+                        project_labels=workspace["labels"],
+                        config=payload,
+                    )
+                    if progress_dialog is not None:
+                        progress_dialog.update_progress(progress_index, image_name, total_added_count)
+                except ValueError as error:
+                    if progress_dialog is not None:
+                        progress_dialog.close()
+                    if len(indexes) == 1:
+                        messagebox.showerror("Model", str(error), parent=self.view)
+                    else:
+                        messagebox.showerror(
+                            "Model",
+                            f"Autolabeling taska zostal przerwany na obrazie {progress_index}/{len(indexes)} ({image_name}). Dodano dotad {total_added_count} annotacji.\n\n{error}",
+                            parent=self.view,
+                        )
+                    return
+        finally:
+            if progress_dialog is not None and progress_dialog.winfo_exists():
+                progress_dialog.close()
 
         self._get_task_workspace(self.current_task_id, force_reload=True)
         self.open_task(self.current_task_id)
-        messagebox.showinfo("Model", f"Dodano {added_count} annotacji z modelu.", parent=self.view)
+        if len(indexes) == 1:
+            messagebox.showinfo("Model", f"Dodano {total_added_count} annotacji z modelu.", parent=self.view)
+            return
+        messagebox.showinfo(
+            "Model",
+            f"Przetworzono {len(indexes)} obrazow i dodano {total_added_count} annotacji z modelu.",
+            parent=self.view,
+        )
 
     def open_page(self, page_name: str) -> None:
         routing = {
             "home": self.show_start_page,
             "projects": self.show_projects_page,
             "settings": self.show_settings_page,
+            "labels-checks": self.show_labels_checks_page,
             "info": self.show_info_page,
         }
         action = routing.get(page_name)
@@ -191,6 +232,10 @@ class AppController:
     def show_settings_page(self) -> None:
         self.current_page = "settings"
         self.view.show_settings_page(self.service.get_settings_description())
+
+    def show_labels_checks_page(self) -> None:
+        self.current_page = "labels-checks"
+        self.view.show_labels_checks_page(self.labels_checks_service.get_description())
 
     def show_info_page(self) -> None:
         self.current_page = "info"
@@ -590,6 +635,24 @@ class AppController:
         if not payload:
             return
         self._run_auto_label_payload(workspace, images, payload)
+
+    def auto_label_task_images(self) -> None:
+        context = self._get_auto_label_context()
+        if context is None:
+            return
+
+        workspace, images, available_modes = context
+        dialog = ModelInferenceDialog(self.view, available_modes, initial_config=self._get_last_model_config_for_modes(available_modes))
+        payload = dialog.show()
+        if not payload:
+            return
+        if not messagebox.askyesno(
+            "Model",
+            f"Uruchomic autoadnotacje dla wszystkich {len(images)} obrazow w tym tasku?",
+            parent=self.view,
+        ):
+            return
+        self._run_auto_label_payload(workspace, images, payload, target_image_indexes=list(range(len(images))))
 
     def run_last_model_for_current_image(self) -> None:
         context = self._get_auto_label_context()

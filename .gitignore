@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 exports/
 database/session_prefill_smoke.sqlite
+projects/

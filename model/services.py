@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import importlib
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import numpy as np
 
 from database.repositories import AppRepository
 from model.entities import LabelTemplate, SessionState
+from model.settings import AppSettings, build_settings_description
 
 try:
     import cv2
@@ -25,6 +27,11 @@ try:
     import torch
 except ImportError:
     torch = None
+
+try:
+    tf = importlib.import_module("tensorflow")
+except ImportError:
+    tf = None
 
 try:
     from ultralytics import YOLO as UltralyticsYOLO
@@ -40,7 +47,9 @@ except ImportError:
 class AppService:
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
     VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
-    MODEL_EXTENSIONS = {".onnx", ".pt", ".pth", ".ckpt", ".ts", ".jit", ".torchscript"}
+    PYTORCH_MODEL_EXTENSIONS = {".pt", ".pth", ".ckpt", ".ts", ".jit", ".torchscript"}
+    TENSORFLOW_MODEL_EXTENSIONS = {".h5", ".keras", ".tflite"}
+    MODEL_EXTENSIONS = {".onnx"} | PYTORCH_MODEL_EXTENSIONS | TENSORFLOW_MODEL_EXTENSIONS
     SUPPORTED_IMAGE_EXTENSIONS = IMAGE_EXTENSIONS
     LABEL_TYPES = [
         "Bounding box",
@@ -61,6 +70,7 @@ class AppService:
     MODEL_RUNTIME_OPTIONS = {
         "auto": "Auto (wykryj implementacje)",
         "onnx": "ONNX / OpenCV DNN",
+        "tensorflow": "TensorFlow",
         "ultralytics": "Ultralytics YOLO",
         "torchscript": "TorchScript",
         "pytorch": "PyTorch",
@@ -142,7 +152,11 @@ class AppService:
         return "Jeszcze sie buduje tej"
 
     def get_settings_description(self) -> str:
-        return "Jeszcze nie."
+        return build_settings_description(
+            AppSettings(
+                projects_root=str(self.projects_root),
+            )
+        )
 
     def get_info_description(self) -> str:
         return "Jeszcze sie buduje tej"
@@ -540,10 +554,13 @@ class AppService:
 
     @classmethod
     def get_model_runtime_labels_for_path(cls, model_path: str | None) -> list[str]:
-        suffix = Path(model_path or "").suffix.casefold()
+        candidate_path = Path(model_path or "")
+        suffix = candidate_path.suffix.casefold()
         if suffix == ".onnx":
             return [cls.MODEL_RUNTIME_OPTIONS["auto"], cls.MODEL_RUNTIME_OPTIONS["onnx"]]
-        if suffix in cls.MODEL_EXTENSIONS - {".onnx"}:
+        if suffix in cls.TENSORFLOW_MODEL_EXTENSIONS or cls._is_tensorflow_saved_model_path(candidate_path):
+            return [cls.MODEL_RUNTIME_OPTIONS["auto"], cls.MODEL_RUNTIME_OPTIONS["tensorflow"]]
+        if suffix in cls.PYTORCH_MODEL_EXTENSIONS:
             return [
                 cls.MODEL_RUNTIME_OPTIONS["auto"],
                 cls.MODEL_RUNTIME_OPTIONS["ultralytics"],
@@ -558,6 +575,10 @@ class AppService:
             if label == runtime_label:
                 return key
         return "auto"
+
+    @classmethod
+    def _is_tensorflow_saved_model_path(cls, model_path: Path) -> bool:
+        return model_path.exists() and model_path.is_dir() and (model_path / "saved_model.pb").exists()
 
     def get_available_model_inference_modes(
         self,
@@ -613,8 +634,10 @@ class AppService:
         runtime_preference = (runtime_preference or "auto").strip().casefold()
         if model_runtime == "onnx" and runtime_preference not in {"", "auto", "onnx"}:
             raise ValueError("Dla plikow .onnx dostepna jest tylko implementacja ONNX / OpenCV DNN.")
-        if model_runtime == "pytorch" and runtime_preference == "onnx":
-            raise ValueError("Implementacja ONNX / OpenCV DNN nie obsluguje plikow .pt/.pth/.ts/.jit/.ckpt.")
+        if model_runtime == "tensorflow" and runtime_preference not in {"", "auto", "tensorflow"}:
+            raise ValueError("Dla modeli TensorFlow dostepna jest tylko implementacja TensorFlow.")
+        if model_runtime == "pytorch" and runtime_preference in {"onnx", "tensorflow"}:
+            raise ValueError("Implementacja ONNX / OpenCV DNN ani TensorFlow nie obsluguja plikow .pt/.pth/.ts/.jit/.ckpt.")
 
         supported_modes = {mode for mode, _label in self.get_supported_model_inference_options(project_type, labels)}
         if inference_mode not in supported_modes:
@@ -637,6 +660,18 @@ class AppService:
                     image=image,
                     labels=labels,
                     class_names=class_names,
+                    input_width=input_width,
+                    input_height=input_height,
+                )
+            elif model_runtime == "tensorflow":
+                predicted_label = self._predict_tensorflow_classification_label(
+                    model_path=str(model_file),
+                    image=image,
+                    labels=labels,
+                    class_names=class_names,
+                    runtime_preference=runtime_preference,
+                    confidence_threshold=confidence_threshold,
+                    iou_threshold=iou_threshold,
                     input_width=input_width,
                     input_height=input_height,
                 )
@@ -693,6 +728,45 @@ class AppService:
                     image=image,
                     labels=labels,
                     class_names=class_names,
+                    confidence_threshold=confidence_threshold,
+                    iou_threshold=iou_threshold,
+                    input_width=input_width,
+                    input_height=input_height,
+                )
+            else:
+                raise ValueError("Wybrany tryb inferencji modelu nie jest obslugiwany.")
+        elif model_runtime == "tensorflow":
+            if inference_mode == "detection":
+                predictions = self._predict_tensorflow_detection_annotations(
+                    model_path=str(model_file),
+                    image=image,
+                    labels=labels,
+                    class_names=class_names,
+                    runtime_preference=runtime_preference,
+                    confidence_threshold=confidence_threshold,
+                    iou_threshold=iou_threshold,
+                    input_width=input_width,
+                    input_height=input_height,
+                )
+            elif inference_mode == "pose":
+                predictions = self._predict_tensorflow_pose_annotations(
+                    model_path=str(model_file),
+                    image=image,
+                    labels=labels,
+                    class_names=class_names,
+                    runtime_preference=runtime_preference,
+                    confidence_threshold=confidence_threshold,
+                    iou_threshold=iou_threshold,
+                    input_width=input_width,
+                    input_height=input_height,
+                )
+            elif inference_mode == "segmentation":
+                predictions = self._predict_tensorflow_segmentation_annotations(
+                    model_path=str(model_file),
+                    image=image,
+                    labels=labels,
+                    class_names=class_names,
+                    runtime_preference=runtime_preference,
                     confidence_threshold=confidence_threshold,
                     iou_threshold=iou_threshold,
                     input_width=input_width,
@@ -758,9 +832,13 @@ class AppService:
         suffix = model_path.suffix.casefold()
         if suffix == ".onnx":
             return "onnx"
-        if suffix in self.MODEL_EXTENSIONS - {".onnx"}:
+        if suffix in self.TENSORFLOW_MODEL_EXTENSIONS or self._is_tensorflow_saved_model_path(model_path):
+            return "tensorflow"
+        if suffix in self.PYTORCH_MODEL_EXTENSIONS:
             return "pytorch"
-        raise ValueError("Obslugiwane sa pliki modeli: .onnx, .pt, .pth, .ckpt, .ts, .jit oraz .torchscript.")
+        raise ValueError(
+            "Obslugiwane sa pliki modeli: .onnx, .pt, .pth, .ckpt, .ts, .jit, .torchscript, .h5, .keras, .tflite oraz katalog SavedModel."
+        )
 
     def _clear_model_annotations(self, image_id: int) -> None:
         for annotation in self.repository.list_annotations(image_id):
@@ -1466,6 +1544,424 @@ class AppService:
             predictions.append((label_template, {"type": label_template.label_type, "points": polygon_points}, 1.0))
         return predictions
 
+    def _predict_tensorflow_classification_label(
+        self,
+        model_path: str,
+        image: np.ndarray,
+        labels: list[LabelTemplate],
+        class_names: list[str] | None,
+        runtime_preference: str,
+        confidence_threshold: float,
+        iou_threshold: float,
+        input_width: int,
+        input_height: int,
+    ) -> LabelTemplate:
+        runtime_name, model = self._load_tensorflow_model(model_path, runtime_preference)
+        output = self._run_tensorflow_model(runtime_name, model, image, input_width, input_height)
+        scores = self._extract_classification_scores(output)
+        if scores.size == 0:
+            raise ValueError("Model TensorFlow nie zwrocil zadnych wynikow klasyfikacji.")
+        class_index = int(np.argmax(scores))
+        return self._resolve_model_label_by_index(labels, class_index, class_names)
+
+    def _predict_tensorflow_detection_annotations(
+        self,
+        model_path: str,
+        image: np.ndarray,
+        labels: list[LabelTemplate],
+        class_names: list[str] | None,
+        runtime_preference: str,
+        confidence_threshold: float,
+        iou_threshold: float,
+        input_width: int,
+        input_height: int,
+    ) -> list[tuple[LabelTemplate, dict[str, object], float]]:
+        runtime_name, model = self._load_tensorflow_model(model_path, runtime_preference)
+        prediction = self._extract_tensorflow_prediction(self._run_tensorflow_model(runtime_name, model, image, input_width, input_height))
+        boxes = self._to_numpy_array(prediction.get("boxes"))
+        if boxes is None or boxes.ndim != 2 or boxes.shape[1] < 4:
+            raise ValueError(
+                "Model TensorFlow nie zwrocil boxow w formacie detection. "
+                f"Oczekiwano slownika z kluczem 'boxes' o ksztalcie [N,4+]. Szczegoly wyjscia: {self._describe_prediction_mapping(prediction)}"
+            )
+        scores = self._to_numpy_array(prediction.get("scores"))
+        raw_labels = self._to_numpy_array(prediction.get("labels"))
+
+        image_height, image_width = image.shape[:2]
+        predictions: list[tuple[LabelTemplate, dict[str, object], float]] = []
+        for index, box in enumerate(boxes):
+            confidence = float(scores[index]) if scores is not None and index < len(scores) else 1.0
+            if confidence < confidence_threshold:
+                continue
+            raw_label = int(raw_labels[index]) if raw_labels is not None and index < len(raw_labels) else 0
+            label_template = self._resolve_model_label_from_raw_index(labels, raw_label, class_names)
+            bbox_points = self._normalize_xyxy_box(box, image_width, image_height)
+            predictions.append((label_template, {"type": "Bounding box", "points": bbox_points}, confidence))
+        return predictions
+
+    def _predict_tensorflow_pose_annotations(
+        self,
+        model_path: str,
+        image: np.ndarray,
+        labels: list[LabelTemplate],
+        class_names: list[str] | None,
+        runtime_preference: str,
+        confidence_threshold: float,
+        iou_threshold: float,
+        input_width: int,
+        input_height: int,
+    ) -> list[tuple[LabelTemplate, dict[str, object], float]]:
+        runtime_name, model = self._load_tensorflow_model(model_path, runtime_preference)
+        prediction = self._extract_tensorflow_prediction(self._run_tensorflow_model(runtime_name, model, image, input_width, input_height))
+        keypoints = self._to_numpy_array(prediction.get("keypoints"))
+        if keypoints is None:
+            raise ValueError(
+                "Model TensorFlow nie zwrocil keypointow dla trybu pose. "
+                f"Oczekiwano slownika z kluczem 'keypoints'. Szczegoly wyjscia: {self._describe_prediction_mapping(prediction)}"
+            )
+        if keypoints.ndim == 4 and keypoints.shape[0] == 1:
+            keypoints = keypoints[0]
+        if keypoints.ndim != 3 or keypoints.shape[2] < 2:
+            raise ValueError(
+                "Model TensorFlow zwrocil nieobslugiwany format keypointow. "
+                f"Oczekiwano tensora [N,K,2+] lub [1,N,K,2+]. Otrzymano: {self._describe_value(keypoints)}"
+            )
+
+        scores = self._to_numpy_array(prediction.get("scores"))
+        raw_labels = self._to_numpy_array(prediction.get("labels"))
+        image_height, image_width = image.shape[:2]
+        predictions: list[tuple[LabelTemplate, dict[str, object], float]] = []
+        for index, instance_keypoints in enumerate(keypoints):
+            confidence = float(scores[index]) if scores is not None and index < len(scores) else 1.0
+            if confidence < confidence_threshold:
+                continue
+            raw_label = int(raw_labels[index]) if raw_labels is not None and index < len(raw_labels) else 0
+            label_template = self._resolve_model_label_from_raw_index(labels, raw_label, class_names)
+            expected_count = self._get_expected_pose_keypoint_count(label_template, len(instance_keypoints))
+            if label_template.label_type == "Point":
+                instance_keypoints = instance_keypoints[:1]
+            elif len(instance_keypoints) != expected_count:
+                raise ValueError(
+                    f"Model TensorFlow zwrocil {len(instance_keypoints)} keypointow, ale etykieta '{label_template.name}' oczekuje {expected_count}."
+                )
+
+            points: list[dict[str, object]] = []
+            for raw_point in instance_keypoints[:expected_count]:
+                raw_x = float(raw_point[0])
+                raw_y = float(raw_point[1])
+                raw_visibility = float(raw_point[2]) if len(raw_point) >= 3 else 1.0
+                point_x, point_y = self._normalize_point_coordinates(raw_x, raw_y, image_width, image_height)
+                is_visible = raw_visibility >= confidence_threshold if 0.0 <= raw_visibility <= 1.0 else raw_visibility > 0.0
+                point_payload: dict[str, object] = {
+                    "x": point_x if is_visible else 0.0,
+                    "y": point_y if is_visible else 0.0,
+                }
+                if not is_visible:
+                    point_payload["visibility"] = 0
+                points.append(point_payload)
+
+            annotation_definition: dict[str, object] = {"type": label_template.label_type, "points": points}
+            if label_template.label_type == "Skeleton":
+                annotation_definition["point_count"] = len(points)
+            predictions.append((label_template, annotation_definition, confidence))
+        return predictions
+
+    def _predict_tensorflow_segmentation_annotations(
+        self,
+        model_path: str,
+        image: np.ndarray,
+        labels: list[LabelTemplate],
+        class_names: list[str] | None,
+        runtime_preference: str,
+        confidence_threshold: float,
+        iou_threshold: float,
+        input_width: int,
+        input_height: int,
+    ) -> list[tuple[LabelTemplate, dict[str, object], float]]:
+        runtime_name, model = self._load_tensorflow_model(model_path, runtime_preference)
+        output = self._run_tensorflow_model(runtime_name, model, image, input_width, input_height)
+        try:
+            prediction = self._extract_tensorflow_prediction(output)
+        except ValueError:
+            prediction = None
+
+        if prediction is not None and prediction.get("masks") is not None:
+            masks = self._to_numpy_array(prediction.get("masks"))
+            if masks is None:
+                return []
+            if masks.ndim == 4 and masks.shape[1] == 1:
+                masks = masks[:, 0]
+            scores = self._to_numpy_array(prediction.get("scores"))
+            raw_labels = self._to_numpy_array(prediction.get("labels"))
+            predictions: list[tuple[LabelTemplate, dict[str, object], float]] = []
+            for index, mask in enumerate(masks):
+                confidence = float(scores[index]) if scores is not None and index < len(scores) else 1.0
+                if confidence < confidence_threshold:
+                    continue
+                raw_label = int(raw_labels[index]) if raw_labels is not None and index < len(raw_labels) else 0
+                label_template = self._resolve_model_label_from_raw_index(labels, raw_label, class_names)
+                polygon_points = self._mask_array_to_polygon_points(mask, image.shape[1], image.shape[0])
+                if len(polygon_points) < 3:
+                    continue
+                predictions.append((label_template, {"type": label_template.label_type, "points": polygon_points}, confidence))
+            return predictions
+
+        semantic_scores = self._extract_semantic_segmentation_scores(output)
+        class_map = np.argmax(semantic_scores, axis=0)
+        predictions = []
+        for raw_label in sorted(int(value) for value in np.unique(class_map)):
+            if class_names is None and semantic_scores.shape[0] == len(labels) + 1 and raw_label == 0:
+                continue
+            mask = class_map == raw_label
+            if int(np.count_nonzero(mask)) < 9:
+                continue
+            label_template = self._resolve_model_label_from_raw_index(labels, raw_label, class_names)
+            polygon_points = self._mask_array_to_polygon_points(mask.astype(np.float32), image.shape[1], image.shape[0])
+            if len(polygon_points) < 3:
+                continue
+            predictions.append((label_template, {"type": label_template.label_type, "points": polygon_points}, 1.0))
+        return predictions
+
+    def _load_tensorflow_model(self, model_path: str, runtime_preference: str = "auto") -> tuple[str, object]:
+        if tf is None:
+            raise ValueError("Obsluga modeli TensorFlow wymaga zainstalowanego pakietu tensorflow.")
+
+        runtime_preference = (runtime_preference or "auto").strip().casefold()
+        if runtime_preference not in {"auto", "tensorflow"}:
+            raise ValueError("Dla modeli TensorFlow dostepna jest tylko implementacja TensorFlow.")
+
+        model_file = Path(model_path)
+        try:
+            if model_file.suffix.casefold() == ".tflite":
+                interpreter = tf.lite.Interpreter(model_path=model_path)
+                interpreter.allocate_tensors()
+                return "tflite", interpreter
+            if self._is_tensorflow_saved_model_path(model_file):
+                saved_model = tf.saved_model.load(model_path)
+                signatures = getattr(saved_model, "signatures", {})
+                signature = signatures.get("serving_default") if isinstance(signatures, dict) else None
+                if signature is None and signatures:
+                    signature = next(iter(signatures.values()))
+                if signature is not None or callable(saved_model):
+                    return "savedmodel", (saved_model, signature)
+                raise ValueError("katalog SavedModel nie udostepnia uruchamialnej sygnatury inferencyjnej.")
+
+            keras_model = tf.keras.models.load_model(model_path, compile=False)
+            if hasattr(keras_model, "__call__"):
+                return "keras", keras_model
+            raise ValueError("plik nie zawiera uruchamialnego modelu TensorFlow.")
+        except Exception as error:
+            raise ValueError(f"Nie udalo sie uruchomic modelu TensorFlow. {error}") from error
+
+    def _run_tensorflow_model(self, runtime_name: str, model, image: np.ndarray, input_width: int, input_height: int):
+        if tf is None:
+            raise ValueError("Obsluga modeli TensorFlow wymaga zainstalowanego pakietu tensorflow.")
+
+        if runtime_name == "tflite":
+            interpreter = model
+            input_details = interpreter.get_input_details()
+            if not input_details:
+                raise ValueError("Model TFLite nie ma zdefiniowanych wejsc inferencji.")
+            input_detail = input_details[0]
+            input_array = self._build_tensorflow_input_array(
+                image,
+                input_width,
+                input_height,
+                input_detail.get("dtype", np.float32),
+                input_detail.get("quantization"),
+            )
+            interpreter.set_tensor(input_detail["index"], input_array)
+            interpreter.invoke()
+            output_details = interpreter.get_output_details()
+            outputs = [interpreter.get_tensor(detail["index"]) for detail in output_details]
+            return self._format_tflite_outputs(output_details, outputs)
+
+        input_array = self._build_tensorflow_input_array(image, input_width, input_height, np.float32)
+        input_tensor = tf.convert_to_tensor(input_array)
+        if runtime_name == "savedmodel":
+            saved_model, signature = model
+            if signature is not None:
+                structured_signature = getattr(signature, "structured_input_signature", None)
+                keyword_inputs = structured_signature[1] if structured_signature is not None else {}
+                if keyword_inputs:
+                    input_name = next(iter(keyword_inputs))
+                    return signature(**{input_name: input_tensor})
+                return signature(input_tensor)
+            callable_model = saved_model
+        else:
+            callable_model = model
+        try:
+            return callable_model(input_tensor, training=False)
+        except TypeError:
+            return callable_model(input_tensor)
+
+    def _build_tensorflow_input_array(
+        self,
+        image: np.ndarray,
+        input_width: int,
+        input_height: int,
+        dtype,
+        quantization: tuple[float, int] | None = None,
+    ) -> np.ndarray:
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        resized_image = cv2.resize(rgb_image, (input_width, input_height), interpolation=cv2.INTER_LINEAR)
+        numpy_dtype = np.dtype(dtype)
+        if np.issubdtype(numpy_dtype, np.floating):
+            input_array = resized_image.astype(np.float32) / 255.0
+            return np.expand_dims(input_array.astype(numpy_dtype, copy=False), axis=0)
+
+        input_array = resized_image.astype(np.float32)
+        quantization_scale = 0.0
+        quantization_zero_point = 0
+        if quantization is not None and len(quantization) == 2:
+            quantization_scale, quantization_zero_point = quantization
+        if quantization_scale:
+            input_array = np.round(input_array / float(quantization_scale) + int(quantization_zero_point))
+        dtype_limits = np.iinfo(numpy_dtype)
+        input_array = np.clip(input_array, dtype_limits.min, dtype_limits.max).astype(numpy_dtype)
+        return np.expand_dims(input_array, axis=0)
+
+    def _format_tflite_outputs(self, output_details: list[dict[str, object]], outputs: list[object]):
+        if not outputs:
+            raise ValueError("Model TFLite nie zwrocil zadnych wynikow.")
+        if len(outputs) == 1:
+            return outputs[0]
+
+        named_outputs: dict[str, object] = {}
+        for index, (detail, value) in enumerate(zip(output_details, outputs)):
+            output_name = str(detail.get("name") or f"output_{index}")
+            clean_name = output_name.split(":")[0].split("/")[-1]
+            named_outputs[f"output_{index}"] = value
+            named_outputs[clean_name] = value
+
+        inferred_prediction = self._infer_tensorflow_prediction_from_sequence(outputs)
+        if inferred_prediction is not None:
+            named_outputs.update(inferred_prediction)
+        return named_outputs
+
+    def _extract_tensorflow_prediction(self, output) -> dict[str, object]:
+        candidate = output
+        if isinstance(candidate, (list, tuple)):
+            inferred_prediction = self._infer_tensorflow_prediction_from_sequence(candidate)
+            if inferred_prediction is not None:
+                return inferred_prediction
+            if len(candidate) == 1:
+                candidate = candidate[0]
+
+        if not isinstance(candidate, dict):
+            raise ValueError(
+                "Model TensorFlow nie zwrocil obslugiwanego slownika predykcji. "
+                "Aplikacja oczekuje: dict albo listy/tuple zawierajacej dict. "
+                f"Rzeczywiste wyjscie modelu: {self._describe_value(output)}"
+            )
+
+        prediction: dict[str, object] = {}
+        raw_boxes = candidate.get("boxes", candidate.get("detection_boxes"))
+        if raw_boxes is not None:
+            boxes = self._to_numpy_array(raw_boxes)
+            if boxes is not None:
+                boxes = self._squeeze_prediction_array(boxes)
+                if "detection_boxes" in candidate:
+                    boxes = self._convert_tensorflow_yxyx_boxes_to_xyxy(boxes)
+                prediction["boxes"] = boxes
+
+        raw_scores = candidate.get("scores", candidate.get("detection_scores"))
+        if raw_scores is not None:
+            scores = self._to_numpy_array(raw_scores)
+            if scores is not None:
+                prediction["scores"] = self._squeeze_prediction_array(scores)
+
+        raw_labels = candidate.get("labels", candidate.get("classes", candidate.get("class_ids", candidate.get("detection_classes"))))
+        if raw_labels is not None:
+            labels = self._to_numpy_array(raw_labels)
+            if labels is not None:
+                prediction["labels"] = self._squeeze_prediction_array(labels)
+
+        raw_keypoints = candidate.get("keypoints", candidate.get("detection_keypoints"))
+        if raw_keypoints is not None:
+            keypoints = self._to_numpy_array(raw_keypoints)
+            if keypoints is not None:
+                keypoints = self._squeeze_prediction_array(keypoints)
+                if "detection_keypoints" in candidate:
+                    keypoints = self._convert_tensorflow_yx_keypoints_to_xy(keypoints)
+                prediction["keypoints"] = keypoints
+
+        raw_masks = candidate.get("masks", candidate.get("detection_masks"))
+        if raw_masks is not None:
+            masks = self._to_numpy_array(raw_masks)
+            if masks is not None:
+                prediction["masks"] = self._squeeze_prediction_array(masks)
+
+        if prediction:
+            return prediction
+
+        raise ValueError(
+            "Model TensorFlow nie zwrocil rozpoznanego slownika predykcji dla detection/pose/segmentation. "
+            f"Dostepne klucze: {', '.join(str(key) for key in candidate.keys()) or 'brak'}"
+        )
+
+    def _infer_tensorflow_prediction_from_sequence(self, output_sequence) -> dict[str, object] | None:
+        arrays: list[np.ndarray] = []
+        for value in output_sequence:
+            array_value = self._to_numpy_array(value)
+            if array_value is None:
+                continue
+            arrays.append(self._squeeze_prediction_array(np.array(array_value)))
+        if not arrays:
+            return None
+
+        boxes = next((array for array in arrays if array.ndim == 2 and array.shape[1] >= 4), None)
+        keypoints = next((array for array in arrays if array.ndim == 3 and array.shape[2] >= 2), None)
+        masks = next((array for array in arrays if array.ndim in {3, 4} and array.shape[-1] not in {2, 3, 4}), None)
+        vector_candidates = [array for array in arrays if array.ndim == 1]
+
+        prediction: dict[str, object] = {}
+        candidate_length = len(boxes) if boxes is not None else (len(keypoints) if keypoints is not None else None)
+        if boxes is not None:
+            prediction["boxes"] = self._convert_tensorflow_yxyx_boxes_to_xyxy(boxes)
+        if keypoints is not None:
+            prediction["keypoints"] = self._convert_tensorflow_yx_keypoints_to_xy(keypoints)
+        if masks is not None:
+            prediction["masks"] = masks
+        if candidate_length is not None:
+            score_candidates = [array for array in vector_candidates if len(array) == candidate_length]
+            label_candidate = next((array for array in score_candidates if self._looks_like_class_indices(array)), None)
+            score_candidate = next((array for array in score_candidates if array is not label_candidate), None)
+            if label_candidate is not None:
+                prediction["labels"] = label_candidate
+            if score_candidate is not None:
+                prediction["scores"] = score_candidate
+        return prediction or None
+
+    def _squeeze_prediction_array(self, array: np.ndarray) -> np.ndarray:
+        return array[0] if array.ndim > 0 and array.shape[0] == 1 else array
+
+    def _convert_tensorflow_yxyx_boxes_to_xyxy(self, boxes: np.ndarray) -> np.ndarray:
+        boxes = np.array(boxes, dtype=np.float32)
+        if boxes.ndim != 2 or boxes.shape[1] < 4:
+            return boxes
+        converted = boxes.copy()
+        converted[:, 0] = boxes[:, 1]
+        converted[:, 1] = boxes[:, 0]
+        converted[:, 2] = boxes[:, 3]
+        converted[:, 3] = boxes[:, 2]
+        return converted
+
+    def _convert_tensorflow_yx_keypoints_to_xy(self, keypoints: np.ndarray) -> np.ndarray:
+        keypoints = np.array(keypoints, dtype=np.float32)
+        if keypoints.ndim != 3 or keypoints.shape[2] < 2:
+            return keypoints
+        converted = keypoints.copy()
+        converted[:, :, 0] = keypoints[:, :, 1]
+        converted[:, :, 1] = keypoints[:, :, 0]
+        return converted
+
+    def _looks_like_class_indices(self, values: np.ndarray) -> bool:
+        flattened = np.array(values, dtype=np.float32).reshape(-1)
+        if flattened.size == 0 or not np.all(np.isfinite(flattened)):
+            return False
+        return np.allclose(flattened, np.round(flattened), atol=1e-4)
+
     def _load_pytorch_model(self, model_path: str, runtime_preference: str = "auto") -> tuple[str, object]:
         if torch is None:
             raise ValueError("Obsluga modeli .pt wymaga zainstalowanego pakietu torch.")
@@ -1757,12 +2253,14 @@ class AppService:
             candidate = candidate[0]
         scores = self._to_numpy_array(candidate)
         if scores is None:
-            raise ValueError("Model .pt nie zwrocil map segmentacji.")
+            raise ValueError("Model nie zwrocil map segmentacji.")
         scores = np.array(scores, dtype=np.float32)
         if scores.ndim == 4 and scores.shape[0] == 1:
             scores = scores[0]
+        if scores.ndim == 3 and scores.shape[2] < scores.shape[0] and scores.shape[2] < scores.shape[1]:
+            scores = np.transpose(scores, (2, 0, 1))
         if scores.ndim != 3:
-            raise ValueError("Model .pt zwrocil nieobslugiwany format map segmentacji.")
+            raise ValueError("Model zwrocil nieobslugiwany format map segmentacji.")
         return scores
 
     def _to_numpy_array(self, value) -> np.ndarray | None:
@@ -1770,6 +2268,8 @@ class AppService:
             return None
         if isinstance(value, np.ndarray):
             return value
+        if tf is not None and isinstance(value, tf.Tensor):
+            return value.numpy()
         if torch is not None and isinstance(value, torch.Tensor):
             return value.detach().cpu().numpy()
         return np.array(value)
