@@ -77,3 +77,4 @@ class SessionState:
     window_width: int = 1400
     window_height: int = 900
     last_model_config: dict[str, object] | None = None
+    last_task_dialog_config: dict[str, object] | None = None

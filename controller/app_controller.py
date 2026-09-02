@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from queue import Empty, Queue
+import threading
 from tkinter import messagebox
 
 from database.repositories import AppRepository
@@ -11,6 +13,9 @@ from gui.dialogs import (
     CreateProjectDialog,
     CreateTaskDialog,
     ExportDialog,
+    ImportDatasetDialog,
+    MergeProjectsDialog,
+    ImportTypeFilterDialog,
     MergeDialog,
     ModelInferenceDialog,
 )
@@ -53,6 +58,7 @@ class AppController:
         self.view.set_navigation_callback(self.open_page)
         self.view.set_create_project_callback(self.open_create_project_dialog)
         self.view.set_export_project_callback(self.open_export_dialog)
+        self.view.set_import_dataset_callback(self.open_import_dataset_dialog)
         self.view.set_open_project_callback(self.open_project)
         self.view.set_back_to_projects_callback(self.show_projects_page)
         self.view.set_create_task_callback(self.open_create_task_dialog)
@@ -72,6 +78,159 @@ class AppController:
         self.view.set_copy_previous_annotation_callback(self.copy_annotation_from_previous_image)
         self.view.set_change_image_callback(self.change_image)
         self.view.set_close_callback(self.on_close)
+
+    def _run_dataset_import_with_progress(self, action):
+        progress_dialog = BatchProgressDialog(self.view, "Import Dataset", 1)
+        progress_dialog.status_var.set("Trwa import datasetu. To moze potrwac chwile...")
+        progress_dialog.counter_var.set("0 / 1")
+        progress_dialog.details_var.set("Zaimportowane annotacje: 0")
+        progress_dialog.set_indeterminate(True)
+        progress_dialog._refresh()
+        event_queue: Queue = Queue()
+        state: dict[str, object] = {"done": False, "result": None, "error": None, "last_annotations": 0}
+
+        def on_progress(completed_images: int, total_images: int, current_image_name: str, imported_annotations: int) -> None:
+            event_queue.put(("progress", int(completed_images), int(total_images), current_image_name, int(imported_annotations)))
+
+        def worker() -> None:
+            try:
+                result = action(on_progress)
+                event_queue.put(("done", result))
+            except Exception as error:
+                event_queue.put(("error", error))
+
+        def poll_queue() -> None:
+            while True:
+                try:
+                    event = event_queue.get_nowait()
+                except Empty:
+                    break
+
+                event_type = event[0]
+                if event_type == "progress":
+                    _, completed_images, total_images, current_image_name, imported_annotations = event
+                    safe_total = max(1, int(total_images))
+                    bounded_completed = max(0, min(int(completed_images), safe_total))
+                    progress_dialog.set_indeterminate(False)
+                    progress_dialog.progress.configure(maximum=safe_total, value=bounded_completed)
+                    progress_dialog.counter_var.set(f"{int(completed_images)} / {int(total_images)}")
+                    if current_image_name:
+                        progress_dialog.status_var.set(f"Import obrazu {int(completed_images)}/{int(total_images)}: {current_image_name}")
+                    else:
+                        progress_dialog.status_var.set("Trwa import datasetu. To moze potrwac chwile...")
+                    progress_dialog.details_var.set(f"Zaimportowane annotacje: {int(imported_annotations)}")
+                    state["last_annotations"] = int(imported_annotations)
+                    progress_dialog._refresh()
+                elif event_type == "done":
+                    state["done"] = True
+                    state["result"] = event[1]
+                elif event_type == "error":
+                    state["done"] = True
+                    state["error"] = event[1]
+
+            if bool(state["done"]):
+                progress_dialog.set_indeterminate(False)
+                progress_dialog.status_var.set("Import zakonczony")
+                progress_dialog.details_var.set(f"Zaimportowane annotacje: {int(state['last_annotations'])}")
+                progress_dialog._refresh()
+                if progress_dialog.winfo_exists():
+                    progress_dialog.close()
+                return
+
+            if progress_dialog.winfo_exists():
+                self.view.after(50, poll_queue)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.view.after(0, poll_queue)
+        progress_dialog.wait_window(progress_dialog)
+        if state["error"] is not None:
+            raise state["error"]
+        return state["result"]
+
+    def _run_video_import_with_progress(self, action):
+        progress_dialog = BatchProgressDialog(self.view, "Import klatek z wideo", 1)
+        progress_dialog.status_var.set("Trwa import klatek. To moze potrwac chwile...")
+        progress_dialog.counter_var.set("0 / 1")
+        progress_dialog.details_var.set("Zaimportowane klatki: 0")
+        progress_dialog.set_indeterminate(True)
+        progress_dialog._refresh()
+
+        event_queue: Queue = Queue()
+        state: dict[str, object] = {"done": False, "result": None, "error": None, "last_completed": 0, "last_total": 1}
+
+        def on_progress(completed_images: int, total_images: int, current_image_name: str, _imported_annotations: int) -> None:
+            event_queue.put(("progress", int(completed_images), int(total_images), current_image_name))
+
+        def worker() -> None:
+            try:
+                result = action(on_progress)
+                event_queue.put(("done", result))
+            except Exception as error:
+                event_queue.put(("error", error))
+
+        def poll_queue() -> None:
+            while True:
+                try:
+                    event = event_queue.get_nowait()
+                except Empty:
+                    break
+
+                event_type = event[0]
+                if event_type == "progress":
+                    _, completed_frames, total_frames, current_name = event
+                    safe_total = max(1, int(total_frames))
+                    bounded_completed = max(0, min(int(completed_frames), safe_total))
+                    progress_dialog.set_indeterminate(False)
+                    progress_dialog.progress.configure(maximum=safe_total, value=bounded_completed)
+                    progress_dialog.counter_var.set(f"{int(completed_frames)} / {int(total_frames)}")
+                    if current_name:
+                        progress_dialog.status_var.set(
+                            f"Import klatki {int(completed_frames)}/{int(total_frames)}: {current_name}"
+                        )
+                    else:
+                        progress_dialog.status_var.set("Trwa import klatek. To moze potrwac chwile...")
+                    progress_dialog.details_var.set(f"Zaimportowane klatki: {bounded_completed}")
+                    progress_dialog._refresh()
+                    state["last_completed"] = bounded_completed
+                    state["last_total"] = safe_total
+                elif event_type == "done":
+                    state["done"] = True
+                    state["result"] = event[1]
+                elif event_type == "error":
+                    state["done"] = True
+                    state["error"] = event[1]
+
+            if bool(state["done"]):
+                progress_dialog.set_indeterminate(False)
+                progress_dialog.status_var.set("Import klatek zakonczony")
+                progress_dialog.counter_var.set(f"{int(state['last_completed'])} / {int(state['last_total'])}")
+                progress_dialog.details_var.set(f"Zaimportowane klatki: {int(state['last_completed'])}")
+                progress_dialog._refresh()
+                if progress_dialog.winfo_exists():
+                    progress_dialog.close()
+                return
+
+            if progress_dialog.winfo_exists():
+                self.view.after(50, poll_queue)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.view.after(0, poll_queue)
+        progress_dialog.wait_window(progress_dialog)
+        if state["error"] is not None:
+            raise state["error"]
+        return state["result"]
+
+    def _resolve_allowed_label_types(self, dataset_folder: str, dataset_format: str) -> list[str] | None:
+        detected_types = self.service.detect_dataset_annotation_types(dataset_folder, dataset_format)
+        if len(detected_types) <= 1:
+            return detected_types or None
+
+        dialog = ImportTypeFilterDialog(self.view, detected_types)
+        payload = dialog.show()
+        if not payload:
+            return []
+        selected = [label_type for label_type in payload.get("allowed_label_types", []) if isinstance(label_type, str)]
+        return selected
 
     def run(self) -> None:
         self.session_state = self.service.load_session_state()
@@ -104,6 +263,7 @@ class AppController:
             window_width=width,
             window_height=height,
             last_model_config=self.session_state.last_model_config,
+            last_task_dialog_config=self.session_state.last_task_dialog_config,
         )
 
     def _save_session_state(self) -> None:
@@ -306,6 +466,92 @@ class AppController:
             parent=self.view,
         )
 
+    def open_import_dataset_dialog(self) -> None:
+        project_id = self.current_project_id
+        if project_id is None:
+            project_id = self.view.get_selected_project_id()
+
+        dialog = ImportDatasetDialog(self.view, self.service.DATASET_IMPORT_FORMATS)
+        payload = dialog.show()
+        if not payload:
+            return
+
+        dataset_folder = payload["dataset_folder"]
+        dataset_format = payload["dataset_format"]
+        default_task_name = Path(dataset_folder).name or "imported_task"
+        task_name = str(payload.get("task_name") or "").strip() or default_task_name
+
+        try:
+            allowed_label_types = self._resolve_allowed_label_types(dataset_folder, dataset_format)
+        except ValueError as error:
+            messagebox.showerror("Import Dataset", str(error), parent=self.view)
+            return
+        if allowed_label_types == []:
+            return
+
+        if project_id is None:
+            try:
+                created_project_id, _task_id = self._run_dataset_import_with_progress(
+                    lambda progress_callback: self.service.import_dataset_with_auto_project(
+                        dataset_folder=dataset_folder,
+                        dataset_format=dataset_format,
+                        task_name=task_name,
+                        project_name=Path(dataset_folder).name,
+                        storage_folder=self.service.get_default_projects_root(),
+                        allowed_label_types=allowed_label_types,
+                        progress_callback=progress_callback,
+                    )
+                )
+            except ValueError as error:
+                messagebox.showerror("Import Dataset", str(error), parent=self.view)
+                return
+
+            report = self.service.pop_last_dataset_import_report() or {}
+            skipped = int(report.get("skipped_missing_images", 0))
+            self.open_project(created_project_id)
+            message = "Dataset zostal zaimportowany. Utworzono nowy projekt i task automatycznie."
+            if skipped > 0:
+                message += f"\n\nPominieto {skipped} obrazow, bo nie znaleziono ich plikow dla annotacji."
+            messagebox.showinfo(
+                "Import Dataset",
+                message,
+                parent=self.view,
+            )
+            return
+
+        try:
+            self._run_dataset_import_with_progress(
+                lambda progress_callback: self.service.create_task(
+                    project_id=project_id,
+                    task_name=task_name,
+                    dataset_folder=dataset_folder,
+                    image_paths=[],
+                    video_path="",
+                    frame_stride=30,
+                    import_mode="dataset",
+                    dataset_format=dataset_format,
+                    allowed_label_types=allowed_label_types,
+                    progress_callback=progress_callback,
+                )
+            )
+        except ValueError as error:
+            messagebox.showerror("Import Dataset", str(error), parent=self.view)
+            return
+
+        report = self.service.pop_last_dataset_import_report() or {}
+        skipped = int(report.get("skipped_missing_images", 0))
+        if skipped > 0:
+            messagebox.showinfo(
+                "Import Dataset",
+                f"Pominieto {skipped} obrazow, bo nie znaleziono ich plikow dla annotacji.",
+                parent=self.view,
+            )
+
+        if self.current_project_id == project_id:
+            self.open_project(project_id)
+            return
+        self.show_projects_page()
+
     def open_project(self, project_id: int) -> None:
         try:
             project = self.service.get_project(project_id)
@@ -325,25 +571,84 @@ class AppController:
         if self.current_project_id is None:
             return
 
-        dialog = CreateTaskDialog(self.view)
+        initial_task_dialog_config = (
+            dict(self.session_state.last_task_dialog_config)
+            if isinstance(self.session_state.last_task_dialog_config, dict)
+            else None
+        )
+        dialog = CreateTaskDialog(self.view, initial_config=initial_task_dialog_config)
         payload = dialog.show()
         if not payload:
             return
 
+        dialog_state = payload.get("dialog_state")
+        if isinstance(dialog_state, dict):
+            self.session_state.last_task_dialog_config = dict(dialog_state)
+            self._save_session_state()
+
         try:
-            self.service.create_task(
-                project_id=self.current_project_id,
-                task_name=payload["task_name"],
-                dataset_folder=payload["dataset_folder"],
-                image_paths=payload["image_paths"],
-                video_path=payload["video_path"],
-                frame_stride=payload["frame_stride"],
-                import_mode=payload["import_mode"],
-                dataset_format=payload.get("dataset_format", ""),
-            )
+            if payload["import_mode"] == "dataset":
+                allowed_label_types = self._resolve_allowed_label_types(payload["dataset_folder"], payload.get("dataset_format", ""))
+                if allowed_label_types == []:
+                    return
+                self._run_dataset_import_with_progress(
+                    lambda progress_callback: self.service.create_task(
+                        project_id=self.current_project_id,
+                        task_name=payload["task_name"],
+                        dataset_folder=payload["dataset_folder"],
+                        dataset_folders=payload.get("dataset_folders", []),
+                        image_paths=payload["image_paths"],
+                        video_path=payload["video_path"],
+                        video_paths=payload.get("video_paths", []),
+                        frame_stride=payload["frame_stride"],
+                        import_mode=payload["import_mode"],
+                        dataset_format=payload.get("dataset_format", ""),
+                        allowed_label_types=allowed_label_types,
+                        progress_callback=progress_callback,
+                    )
+                )
+            elif payload["import_mode"] == "video":
+                self._run_video_import_with_progress(
+                    lambda progress_callback: self.service.create_task(
+                        project_id=self.current_project_id,
+                        task_name=payload["task_name"],
+                        dataset_folder=payload["dataset_folder"],
+                        dataset_folders=payload.get("dataset_folders", []),
+                        image_paths=payload["image_paths"],
+                        video_path=payload["video_path"],
+                        video_paths=payload.get("video_paths", []),
+                        frame_stride=payload["frame_stride"],
+                        import_mode=payload["import_mode"],
+                        dataset_format=payload.get("dataset_format", ""),
+                        progress_callback=progress_callback,
+                    )
+                )
+            else:
+                self.service.create_task(
+                    project_id=self.current_project_id,
+                    task_name=payload["task_name"],
+                    dataset_folder=payload["dataset_folder"],
+                    dataset_folders=payload.get("dataset_folders", []),
+                    image_paths=payload["image_paths"],
+                    video_path=payload["video_path"],
+                    video_paths=payload.get("video_paths", []),
+                    frame_stride=payload["frame_stride"],
+                    import_mode=payload["import_mode"],
+                    dataset_format=payload.get("dataset_format", ""),
+                )
         except ValueError as error:
             messagebox.showerror("Task", str(error), parent=self.view)
             return
+
+        if payload.get("import_mode") == "dataset":
+            report = self.service.pop_last_dataset_import_report() or {}
+            skipped = int(report.get("skipped_missing_images", 0))
+            if skipped > 0:
+                messagebox.showinfo(
+                    "Task",
+                    f"Pominieto {skipped} obrazow, bo nie znaleziono ich plikow dla annotacji.",
+                    parent=self.view,
+                )
 
         self.open_project(self.current_project_id)
 
@@ -357,23 +662,100 @@ class AppController:
             )
             return
 
-        dialog = MergeDialog(
-            self.view,
-            title="Merge Projects",
-            source_label="Projekt zrodlowy",
-            target_label="Projekt docelowy",
-            options=[(item.id, item.name) for item in projects],
-        )
+        dialog = MergeProjectsDialog(self.view, options=[(item.id, item.name) for item in projects])
         payload = dialog.show()
         if not payload:
             return
 
-        try:
-            self.service.merge_projects(payload["source_id"], payload["target_id"])
-        except ValueError as error:
-            messagebox.showerror("Scalanie projektow", str(error), parent=self.view)
-            return
+        source_ids = [int(source_id) for source_id in payload.get("source_ids", [])]
+        target_id = int(payload["target_id"])
+        delete_sources = bool(payload.get("delete_sources", False))
+        progress_dialog = BatchProgressDialog(self.view, "Scalanie projektow", max(1, len(source_ids)))
+        progress_dialog.status_var.set("Rozpoczynanie scalania projektow...")
+        progress_dialog.counter_var.set(f"0 / {len(source_ids)}")
+        progress_dialog.details_var.set(f"Scalone projekty: 0 / {len(source_ids)}")
+        progress_dialog.progress.configure(maximum=max(1, len(source_ids)), value=0)
+        progress_dialog.set_indeterminate(True)
+        progress_dialog._refresh()
 
+        event_queue: Queue = Queue()
+        merge_state: dict[str, object] = {"done": False, "error": None, "merged_count": 0}
+
+        def merge_worker() -> None:
+            merged_local = 0
+            try:
+                for index, source_id in enumerate(source_ids, start=1):
+                    project_name = next((item.name for item in projects if item.id == source_id), f"ID {source_id}")
+                    event_queue.put(("progress", index - 1, len(source_ids), project_name, merged_local))
+                    self.service.merge_projects(source_id, target_id)
+                    merged_local += 1
+                    event_queue.put(("progress", index, len(source_ids), project_name, merged_local))
+                event_queue.put(("done", merged_local))
+            except Exception as error:
+                event_queue.put(("error", error, merged_local))
+
+        def poll_merge_queue() -> None:
+            while True:
+                try:
+                    event = event_queue.get_nowait()
+                except Empty:
+                    break
+
+                event_type = event[0]
+                if event_type == "progress":
+                    _, completed, total, project_name, merged_local = event
+                    safe_total = max(1, int(total))
+                    progress_dialog.set_indeterminate(False)
+                    progress_dialog.progress.configure(maximum=safe_total, value=max(0, min(int(completed), safe_total)))
+                    progress_dialog.counter_var.set(f"{int(completed)} / {int(total)}")
+                    progress_dialog.status_var.set(f"Scalanie projektu {min(int(completed) + 1, int(total))}/{int(total)}: {project_name}")
+                    progress_dialog.details_var.set(f"Scalone projekty: {int(merged_local)} / {int(total)}")
+                    progress_dialog._refresh()
+                    merge_state["merged_count"] = int(merged_local)
+                elif event_type == "done":
+                    merge_state["done"] = True
+                    merge_state["merged_count"] = int(event[1])
+                elif event_type == "error":
+                    merge_state["done"] = True
+                    merge_state["error"] = event[1]
+                    merge_state["merged_count"] = int(event[2])
+
+            if bool(merge_state["done"]):
+                progress_dialog.set_indeterminate(False)
+                progress_dialog.status_var.set("Scalanie zakonczone.")
+                progress_dialog.details_var.set(
+                    f"Scalone projekty: {int(merge_state['merged_count'])} / {len(source_ids)}"
+                )
+                progress_dialog._refresh()
+                if progress_dialog.winfo_exists():
+                    progress_dialog.close()
+                return
+
+            if progress_dialog.winfo_exists():
+                self.view.after(50, poll_merge_queue)
+
+        threading.Thread(target=merge_worker, daemon=True).start()
+        self.view.after(0, poll_merge_queue)
+        progress_dialog.wait_window(progress_dialog)
+
+        if merge_state["error"] is not None:
+            messagebox.showerror("Scalanie projektow", str(merge_state["error"]), parent=self.view)
+            return
+        merged_count = int(merge_state["merged_count"])
+
+        deleted_count = 0
+        if delete_sources:
+            for source_id in source_ids:
+                try:
+                    self.service.delete_project(source_id)
+                    deleted_count += 1
+                except ValueError:
+                    continue
+
+        summary = f"Scalono {merged_count} projektow do wybranego projektu."
+        if delete_sources:
+            summary += f"\nUsunieto projekty zrodlowe: {deleted_count}."
+        messagebox.showinfo("Scalanie projektow", summary, parent=self.view)
         self.show_projects_page()
 
     def delete_project(self) -> None:
@@ -536,8 +918,8 @@ class AppController:
             messagebox.showerror("Adnotacje", str(error), parent=self.view)
             return
 
-        self._get_task_workspace(self.current_task_id, force_reload=True)
-        self.open_task(self.current_task_id)
+        workspace = self._get_task_workspace(self.current_task_id, force_reload=True)
+        self.view.refresh_task_page(workspace, self.current_image_index)
 
     def copy_annotation_from_previous_image(self, combo_value: str) -> None:
         if self.current_task_id is None:
@@ -582,15 +964,15 @@ class AppController:
             messagebox.showerror("Adnotacje", str(error), parent=self.view)
             return
 
-        self._get_task_workspace(self.current_task_id, force_reload=True)
-        self.open_task(self.current_task_id)
+        workspace = self._get_task_workspace(self.current_task_id, force_reload=True)
+        self.view.refresh_task_page(workspace, self.current_image_index)
 
     def toggle_annotation_visibility(self, annotation_id: int) -> None:
         if self.current_task_id is None:
             return
         self.service.toggle_annotation_visibility(annotation_id)
-        self._get_task_workspace(self.current_task_id, force_reload=True)
-        self.open_task(self.current_task_id)
+        workspace = self._get_task_workspace(self.current_task_id, force_reload=True)
+        self.view.refresh_task_page(workspace, self.current_image_index)
 
     def update_annotation(self, annotation_id: int, annotation_definition: dict[str, object]) -> None:
         try:
@@ -598,15 +980,17 @@ class AppController:
         except ValueError as error:
             messagebox.showerror("Adnotacje", str(error), parent=self.view)
             return
-        self._get_task_workspace(self.current_task_id, force_reload=True)
-        self.open_task(self.current_task_id)
+        if self.current_task_id is None:
+            return
+        workspace = self._get_task_workspace(self.current_task_id, force_reload=True)
+        self.view.refresh_task_page(workspace, self.current_image_index)
 
     def delete_annotation(self, annotation_id: int) -> None:
         if self.current_task_id is None:
             return
         self.service.delete_annotation(annotation_id)
-        self._get_task_workspace(self.current_task_id, force_reload=True)
-        self.open_task(self.current_task_id)
+        workspace = self._get_task_workspace(self.current_task_id, force_reload=True)
+        self.view.refresh_task_page(workspace, self.current_image_index)
 
     def delete_current_image(self) -> None:
         if self.current_task_id is None:
@@ -620,8 +1004,8 @@ class AppController:
         image_id = images[self.current_image_index].id
         self.service.delete_image(image_id)
         self.current_image_index = max(0, self.current_image_index - 1)
-        self._get_task_workspace(self.current_task_id, force_reload=True)
-        self.open_task(self.current_task_id)
+        workspace = self._get_task_workspace(self.current_task_id, force_reload=True)
+        self.view.refresh_task_page(workspace, self.current_image_index)
 
     def auto_label_current_image(self) -> None:
         context = self._get_auto_label_context()

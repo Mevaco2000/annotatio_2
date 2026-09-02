@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sqlite3
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -144,6 +145,9 @@ class AppService:
     def __init__(self, repository: AppRepository, projects_root: Path | None = None) -> None:
         self.repository = repository
         self.projects_root = Path(projects_root) if projects_root is not None else Path.cwd() / "projects"
+        self._last_dataset_import_report: dict[str, int] | None = None
+        self._missing_dataset_image_keys: set[str] = set()
+        self._dataset_image_name_index_cache: dict[str, dict[str, list[Path]]] = {}
 
     def get_default_projects_root(self) -> str:
         return str(self.projects_root)
@@ -210,6 +214,30 @@ class AppService:
 
     def list_projects(self):
         return self.repository.list_projects()
+
+    def detect_dataset_annotation_types(self, dataset_folder: str, dataset_format: str) -> list[str]:
+        clean_folder = dataset_folder.strip()
+        if dataset_format not in self.DATASET_IMPORT_FORMATS:
+            raise ValueError("Wybierz obslugiwany format datasetu do importu.")
+        if not clean_folder:
+            raise ValueError("Wskaz folder datasetu do importu.")
+
+        dataset_root = Path(clean_folder)
+        if not dataset_root.exists() or not dataset_root.is_dir():
+            raise ValueError("Wskazany folder datasetu nie istnieje.")
+
+        if dataset_format == "COCO-like JSON":
+            detected_by_label, _files = self._collect_coco_like_label_type_candidates(dataset_root)
+            detected_types = {label_type for label_types in detected_by_label.values() for label_type in label_types}
+        else:
+            inferred_labels = self._infer_project_labels_from_dataset(dataset_root, dataset_format)
+            detected_types = {label.label_type for label in inferred_labels}
+        return [label_type for label_type in self.LABEL_TYPES if label_type in detected_types]
+
+    def pop_last_dataset_import_report(self) -> dict[str, int] | None:
+        report = self._last_dataset_import_report
+        self._last_dataset_import_report = None
+        return report
 
     def create_project(
         self,
@@ -284,54 +312,502 @@ class AppService:
         project_id: int,
         task_name: str,
         dataset_folder: str,
+        dataset_folders: list[str] | None = None,
         image_paths: list[str] | None = None,
         video_path: str | None = None,
+        video_paths: list[str] | None = None,
         frame_stride: int = 30,
         import_mode: str = "folder",
         dataset_format: str = "",
+        allowed_label_types: list[str] | None = None,
+        progress_callback: Callable[[int, int, str, int], None] | None = None,
     ) -> int:
+        self._last_dataset_import_report = None
         clean_name = task_name.strip()
         if not clean_name:
             raise ValueError("Nazwa taska nie moze byc pusta.")
 
         clean_folder = dataset_folder.strip()
         clean_video_path = video_path.strip() if video_path else ""
+        clean_folder_paths = self._normalize_path_list(dataset_folders)
+        clean_video_paths = self._normalize_path_list(video_paths)
         if import_mode == "images" and image_paths:
             resolved_image_paths = self._validate_explicit_image_paths(image_paths)
             common_path = Path(os.path.commonpath(resolved_image_paths))
             dataset_path = common_path if common_path.is_dir() else common_path.parent
             return self.repository.create_task(project_id, clean_name, str(dataset_path), resolved_image_paths)
 
-        if import_mode == "video" and clean_video_path:
-            extracted_frames = self._extract_video_frames(project_id, clean_name, clean_video_path, frame_stride)
-            return self.repository.create_task(project_id, clean_name, clean_video_path, extracted_frames)
+        if import_mode == "video":
+            if clean_video_path and not clean_video_paths:
+                clean_video_paths = [clean_video_path]
+            if not clean_video_paths:
+                raise ValueError("Wybierz przynajmniej jeden plik wideo do importu.")
+
+            all_frames: list[str] = []
+            estimated_per_video = [self._estimate_saved_video_frames(path, frame_stride) for path in clean_video_paths]
+            total_estimated_frames = max(1, sum(max(1, value) for value in estimated_per_video))
+            if progress_callback is not None:
+                progress_callback(0, total_estimated_frames, "Przygotowanie importu klatek", 0)
+
+            completed_frames = 0
+            for video_index, current_video_path in enumerate(clean_video_paths):
+                expected_frames = max(1, estimated_per_video[video_index])
+
+                def _forward_progress(
+                    local_completed: int,
+                    _local_total: int,
+                    current_image_name: str,
+                    _imported_annotations: int,
+                ) -> None:
+                    if progress_callback is None:
+                        return
+                    mapped_completed = min(total_estimated_frames, completed_frames + max(0, int(local_completed)))
+                    label_name = Path(current_video_path).name
+                    display_name = f"{label_name} | {current_image_name}" if current_image_name else label_name
+                    progress_callback(mapped_completed, total_estimated_frames, display_name, 0)
+
+                extracted_frames = self._extract_video_frames(
+                    project_id,
+                    clean_name,
+                    current_video_path,
+                    frame_stride,
+                    progress_callback=_forward_progress,
+                )
+                all_frames.extend(extracted_frames)
+                completed_frames += max(expected_frames, len(extracted_frames))
+
+            if progress_callback is not None:
+                progress_callback(total_estimated_frames, total_estimated_frames, "Import klatek zakonczony", 0)
+            return self.repository.create_task(
+                project_id,
+                clean_name,
+                " | ".join(clean_video_paths),
+                all_frames,
+            )
 
         if import_mode == "dataset":
             if dataset_format not in self.DATASET_IMPORT_FORMATS:
                 raise ValueError("Wybierz obslugiwany format datasetu do importu.")
             if not clean_folder:
                 raise ValueError("Wskaz folder datasetu do importu.")
-            return self._create_task_from_dataset(project_id, clean_name, clean_folder, dataset_format)
+            return self._create_task_from_dataset(
+                project_id,
+                clean_name,
+                clean_folder,
+                dataset_format,
+                allowed_label_types=allowed_label_types,
+                progress_callback=progress_callback,
+            )
 
-        if clean_folder:
-            folder = Path(clean_folder)
-            if not folder.exists() or not folder.is_dir():
-                raise ValueError("Wskazany folder z datasetem nie istnieje.")
-            resolved_image_paths = self._collect_image_paths_from_folder(folder)
-            if not resolved_image_paths:
-                raise ValueError("W wybranym folderze nie ma obslugiwanych obrazow.")
-            return self.repository.create_task(project_id, clean_name, clean_folder or None, resolved_image_paths)
+        if import_mode == "folder":
+            if clean_folder and not clean_folder_paths:
+                clean_folder_paths = [clean_folder]
+            if not clean_folder_paths:
+                raise ValueError("Wybierz przynajmniej jeden folder ze zdjęciami do importu.")
+
+            combined_image_paths: list[str] = []
+            seen_paths: set[str] = set()
+            for folder_path in clean_folder_paths:
+                folder = Path(folder_path)
+                if not folder.exists() or not folder.is_dir():
+                    raise ValueError(f"Wskazany folder z datasetem nie istnieje: {folder_path}")
+                for image_path in self._collect_image_paths_from_folder(folder):
+                    resolved_key = str(Path(image_path).resolve())
+                    if resolved_key in seen_paths:
+                        continue
+                    seen_paths.add(resolved_key)
+                    combined_image_paths.append(image_path)
+            if not combined_image_paths:
+                raise ValueError("W wybranych folderach nie ma obslugiwanych obrazow.")
+            return self.repository.create_task(
+                project_id,
+                clean_name,
+                " | ".join(clean_folder_paths),
+                combined_image_paths,
+            )
 
         raise ValueError("Wybierz folder datasetu, zdjęcia albo plik wideo do importu.")
 
-    def _create_task_from_dataset(self, project_id: int, task_name: str, dataset_folder: str, dataset_format: str) -> int:
+    def import_dataset_with_auto_project(
+        self,
+        dataset_folder: str,
+        dataset_format: str,
+        task_name: str = "",
+        project_name: str = "",
+        storage_folder: str | None = None,
+        allowed_label_types: list[str] | None = None,
+        progress_callback: Callable[[int, int, str, int], None] | None = None,
+    ) -> tuple[int, int]:
+        clean_folder = dataset_folder.strip()
+        if dataset_format not in self.DATASET_IMPORT_FORMATS:
+            raise ValueError("Wybierz obslugiwany format datasetu do importu.")
+        if not clean_folder:
+            raise ValueError("Wskaz folder datasetu do importu.")
+
+        dataset_root = Path(clean_folder)
+        if not dataset_root.exists() or not dataset_root.is_dir():
+            raise ValueError("Wskazany folder datasetu nie istnieje.")
+
+        inferred_labels = self._infer_project_labels_from_dataset(
+            dataset_root,
+            dataset_format,
+            allowed_label_types=allowed_label_types,
+        )
+        if not inferred_labels:
+            raise ValueError("Nie udalo sie wykryc etykiet w wybranym datasecie.")
+
+        inferred_project_type = (
+            "Klasyfikacja"
+            if all(label.label_type == "Klasyfikacja" for label in inferred_labels)
+            else "Wykrywanie"
+        )
+
+        base_project_name = project_name.strip() or f"{dataset_root.name}_import"
+        unique_project_name = self._build_unique_project_name(base_project_name)
+        resolved_task_name = task_name.strip() or dataset_root.name or "imported_task"
+
+        project_id = self.create_project(
+            unique_project_name,
+            inferred_project_type,
+            inferred_labels,
+            storage_folder,
+        )
+        try:
+            task_id = self.create_task(
+                project_id=project_id,
+                task_name=resolved_task_name,
+                dataset_folder=str(dataset_root),
+                image_paths=[],
+                video_path="",
+                frame_stride=30,
+                import_mode="dataset",
+                dataset_format=dataset_format,
+                allowed_label_types=allowed_label_types,
+                progress_callback=progress_callback,
+            )
+            return project_id, task_id
+        except Exception:
+            self.delete_project(project_id)
+            raise
+
+    def _build_unique_project_name(self, base_name: str) -> str:
+        clean_base = base_name.strip() or "import_dataset"
+        existing_names = {project.name.casefold() for project in self.list_projects()}
+        if clean_base.casefold() not in existing_names:
+            return clean_base
+
+        timestamp_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+        first_candidate = f"{clean_base}_{timestamp_suffix}"
+        if first_candidate.casefold() not in existing_names:
+            return first_candidate
+
+        for index in range(2, 1000):
+            candidate = f"{first_candidate}_{index}"
+            if candidate.casefold() not in existing_names:
+                return candidate
+        raise ValueError("Nie udalo sie wygenerowac unikalnej nazwy projektu dla importu.")
+
+    def _infer_project_labels_from_dataset(
+        self,
+        dataset_root: Path,
+        dataset_format: str,
+        allowed_label_types: list[str] | None = None,
+    ) -> list[LabelTemplate]:
+        allowed_types_set = {value for value in (allowed_label_types or []) if value in self.LABEL_TYPES}
+        if dataset_format == "COCO-like JSON":
+            inferred_types = self._infer_coco_like_label_types(dataset_root, allowed_types_set=allowed_types_set)
+        elif dataset_format == "COCO":
+            inferred_types = self._infer_coco_label_types(dataset_root, keypoints=False)
+        elif dataset_format == "COCO Keypoints":
+            inferred_types = self._infer_coco_label_types(dataset_root, keypoints=True)
+        elif dataset_format == "Pascal VOC":
+            inferred_types = self._infer_pascal_voc_label_types(dataset_root)
+        elif dataset_format == "ImageNet":
+            inferred_types = self._infer_imagenet_label_types(dataset_root)
+        elif dataset_format == "YOLO Pose 1.0":
+            inferred_types = self._infer_yolo_pose_label_types(dataset_root)
+        else:
+            raise ValueError(f"Import formatu '{dataset_format}' nie jest obslugiwany.")
+
+        if allowed_types_set:
+            inferred_types = {
+                label_name: label_type
+                for label_name, label_type in inferred_types.items()
+                if label_type in allowed_types_set
+            }
+
+        labels: list[LabelTemplate] = []
+        for label_name, label_type in sorted(inferred_types.items(), key=lambda item: item[0].casefold()):
+            labels.append(
+                LabelTemplate(
+                    id=None,
+                    name=label_name,
+                    label_type=label_type,
+                    preview_image_path=None,
+                    preview_definition=None,
+                )
+            )
+        return labels
+
+    def _infer_coco_like_label_types(
+        self,
+        dataset_root: Path,
+        allowed_types_set: set[str] | None = None,
+    ) -> dict[str, str]:
+        detected_types, annotation_files = self._collect_coco_like_label_type_candidates(dataset_root)
+
+        resolved: dict[str, str] = {}
+        for label_name, types in detected_types.items():
+            eligible_types = set(types)
+            if allowed_types_set:
+                eligible_types &= allowed_types_set
+            if not eligible_types:
+                continue
+            resolved[label_name] = self._select_preferred_label_type(eligible_types, allowed_types_set)
+
+        if not resolved:
+            used_files = ", ".join(path.name for path in annotation_files[:5])
+            if len(annotation_files) > 5:
+                used_files += ", ..."
+            raise ValueError(f"Nie znaleziono etykiet w plikach annotacji: {used_files}.")
+        return resolved
+
+    def _collect_coco_like_label_type_candidates(self, dataset_root: Path) -> tuple[dict[str, set[str]], list[Path]]:
+        categories_by_id: dict[int, str] = {}
+        category_defaults: dict[str, str] = {}
+        annotation_files = self._find_coco_like_annotation_files(dataset_root)
+        detected_types: dict[str, set[str]] = {}
+        for annotation_file in annotation_files:
+            payload = json.loads(annotation_file.read_text(encoding="utf-8"))
+            for category in payload.get("categories", []):
+                if not isinstance(category, dict):
+                    continue
+                if isinstance(category.get("id"), int):
+                    category_name = str(category.get("name") or "").strip()
+                    if category_name:
+                        categories_by_id[int(category["id"])] = category_name
+                label_name = str(category.get("name") or "").strip()
+                if not label_name:
+                    continue
+                raw_type = category.get("label_type") or category.get("supercategory")
+                normalized_type = self._normalize_inferred_label_type(raw_type)
+                if normalized_type:
+                    category_defaults[label_name] = normalized_type
+
+            for annotation in payload.get("annotations", []):
+                if not isinstance(annotation, dict):
+                    continue
+                label_name = str(annotation.get("label_name") or "").strip()
+                if not label_name and isinstance(annotation.get("category_id"), int):
+                    label_name = categories_by_id.get(int(annotation["category_id"]), "")
+                if not label_name:
+                    continue
+
+                raw_definition = annotation.get("raw_definition")
+                if isinstance(raw_definition, dict):
+                    detected_type = self._normalize_inferred_label_type(raw_definition.get("type"))
+                else:
+                    has_keypoints = isinstance(annotation.get("keypoints"), list) and len(annotation.get("keypoints") or []) >= 3
+                    has_segmentation = isinstance(annotation.get("segmentation"), list) and bool(annotation.get("segmentation"))
+                    has_bbox = isinstance(annotation.get("bbox"), list) and len(annotation.get("bbox") or []) >= 4
+                    if has_keypoints:
+                        detected_type = "Skeleton"
+                    elif has_segmentation:
+                        detected_type = "Polygon"
+                    elif has_bbox:
+                        detected_type = "Bounding box"
+                    else:
+                        detected_type = "Klasyfikacja"
+                if not detected_type:
+                    detected_type = category_defaults.get(label_name, "Bounding box")
+
+                detected_types.setdefault(label_name, set()).add(detected_type)
+
+        for label_name, default_type in category_defaults.items():
+            detected_types.setdefault(label_name, {default_type})
+
+        if not detected_types:
+            used_files = ", ".join(path.name for path in annotation_files[:5])
+            if len(annotation_files) > 5:
+                used_files += ", ..."
+            raise ValueError(f"Nie znaleziono etykiet w plikach annotacji: {used_files}.")
+        return detected_types, annotation_files
+
+    def _select_preferred_label_type(self, types: set[str], preferred_types: set[str] | None = None) -> str:
+        if preferred_types:
+            for label_type in self.LABEL_TYPES:
+                if label_type in preferred_types and label_type in types:
+                    return label_type
+        for label_type in self.LABEL_TYPES:
+            if label_type in types:
+                return label_type
+        return sorted(types)[0]
+
+    def _infer_coco_label_types(self, dataset_root: Path, keypoints: bool) -> dict[str, str]:
+        pattern = "person_keypoints_*.json" if keypoints else "instances_*.json"
+        annotation_files = sorted((dataset_root / "annotations").glob(pattern))
+        if not annotation_files:
+            expected_pattern = "person_keypoints_<split>.json" if keypoints else "instances_<split>.json"
+            raise ValueError(f"W wybranym folderze nie znaleziono plikow {expected_pattern}.")
+
+        category_names: dict[int, str] = {}
+        segmentation_stats: dict[int, dict[str, int]] = {}
+
+        for annotation_file in annotation_files:
+            payload = json.loads(annotation_file.read_text(encoding="utf-8"))
+            for category in payload.get("categories", []):
+                if not isinstance(category, dict) or not isinstance(category.get("id"), int):
+                    continue
+                name = str(category.get("name") or "").strip()
+                if name:
+                    category_names[int(category["id"])] = name
+
+            if keypoints:
+                continue
+
+            for annotation in payload.get("annotations", []):
+                if not isinstance(annotation, dict):
+                    continue
+                category_id = annotation.get("category_id")
+                if not isinstance(category_id, int):
+                    continue
+                stats = segmentation_stats.setdefault(category_id, {"total": 0, "with_segmentation": 0})
+                stats["total"] += 1
+                segmentation = annotation.get("segmentation")
+                has_segmentation = isinstance(segmentation, list) and bool(segmentation)
+                if has_segmentation:
+                    stats["with_segmentation"] += 1
+
+        if not category_names:
+            raise ValueError("Nie znaleziono etykiet kategorii w wybranych plikach COCO.")
+
+        inferred: dict[str, str] = {}
+        for category_id, label_name in category_names.items():
+            if keypoints:
+                inferred[label_name] = "Skeleton"
+                continue
+            stats = segmentation_stats.get(category_id)
+            if stats and stats["total"] > 0 and stats["with_segmentation"] == stats["total"]:
+                inferred[label_name] = "Polygon"
+            else:
+                inferred[label_name] = "Bounding box"
+        return inferred
+
+    def _infer_pascal_voc_label_types(self, dataset_root: Path) -> dict[str, str]:
+        annotations_dir = dataset_root / "Annotations"
+        xml_files = sorted(annotations_dir.glob("*.xml"))
+        if not xml_files:
+            raise ValueError("W wybranym folderze nie znaleziono plikow Pascal VOC XML.")
+
+        labels: set[str] = set()
+        for xml_file in xml_files:
+            tree = ET.parse(xml_file)
+            root = tree.getroot()
+            for obj in root.findall("object"):
+                label_name = str(obj.findtext("name") or "").strip()
+                if label_name:
+                    labels.add(label_name)
+
+        if not labels:
+            raise ValueError("Nie znaleziono etykiet w annotacjach Pascal VOC.")
+        return {label_name: "Bounding box" for label_name in labels}
+
+    def _infer_imagenet_label_types(self, dataset_root: Path) -> dict[str, str]:
+        synsets_path = dataset_root / "synsets.txt"
+        label_names: list[str] = []
+        if synsets_path.exists() and synsets_path.is_file():
+            label_names = [line.strip() for line in synsets_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        else:
+            for candidate_dir in sorted(dataset_root.iterdir()):
+                if not candidate_dir.is_dir():
+                    continue
+                has_images = any(
+                    child.is_file() and child.suffix.lower() in self.IMAGE_EXTENSIONS
+                    for child in candidate_dir.iterdir()
+                )
+                if has_images:
+                    label_names.append(candidate_dir.name)
+
+        unique_names = {name for name in label_names if name}
+        if not unique_names:
+            raise ValueError("Nie znaleziono etykiet ImageNet do automatycznego utworzenia projektu.")
+        return {label_name: "Klasyfikacja" for label_name in unique_names}
+
+    def _infer_yolo_pose_label_types(self, dataset_root: Path) -> dict[str, str]:
+        metadata = self._read_ultralytics_data_yaml(dataset_root)
+        class_names_by_index = metadata["names"]
+        labels = {str(label_name).strip() for label_name in class_names_by_index.values() if str(label_name).strip()}
+        if not labels:
+            raise ValueError("Plik data.yaml nie zawiera poprawnych nazw etykiet YOLO Pose.")
+        return {label_name: "Skeleton" for label_name in labels}
+
+    def _normalize_inferred_label_type(self, raw_type: object) -> str:
+        normalized = str(raw_type or "").strip()
+        if normalized in self.LABEL_TYPES:
+            return normalized
+        aliases = {
+            "bbox": "Bounding box",
+            "box": "Bounding box",
+            "rectangle": "Bounding box",
+            "segmentation": "Segmentacja (maska)",
+            "mask": "Segmentacja (maska)",
+            "polygon": "Polygon",
+            "polyline": "Polyline",
+            "point": "Point",
+            "skeleton": "Skeleton",
+            "classification": "Klasyfikacja",
+            "class": "Klasyfikacja",
+        }
+        return aliases.get(normalized.casefold(), "")
+
+    def _create_task_from_dataset(
+        self,
+        project_id: int,
+        task_name: str,
+        dataset_folder: str,
+        dataset_format: str,
+        allowed_label_types: list[str] | None = None,
+        progress_callback: Callable[[int, int, str, int], None] | None = None,
+    ) -> int:
         dataset_root = Path(dataset_folder)
         if not dataset_root.exists() or not dataset_root.is_dir():
             raise ValueError("Wskazany folder datasetu nie istnieje.")
 
+        allowed_types_set = {value for value in (allowed_label_types or []) if value in self.LABEL_TYPES}
+        allowed_label_names: set[str] | None = None
+        if allowed_types_set:
+            inferred_labels = self._infer_project_labels_from_dataset(
+                dataset_root,
+                dataset_format,
+                allowed_label_types=allowed_label_types,
+            )
+            allowed_label_names = {
+                label.name.casefold() for label in inferred_labels if label.label_type in allowed_types_set
+            }
+
+        self._missing_dataset_image_keys = set()
         labels = self.repository.list_label_templates(project_id)
-        imported_items = self._load_dataset_import_items(dataset_root, dataset_format, labels)
+        imported_items = self._load_dataset_import_items(
+            dataset_root,
+            dataset_format,
+            labels,
+            allowed_label_names=allowed_label_names,
+        )
+        skipped_missing_images = len(self._missing_dataset_image_keys)
         if not imported_items:
+            if skipped_missing_images > 0:
+                if progress_callback is not None:
+                    progress_callback(0, 0, "Brak poprawnych obrazow do importu", 0)
+                task_id = self.repository.create_task(
+                    project_id,
+                    task_name,
+                    str(dataset_root),
+                    [],
+                )
+                self._last_dataset_import_report = {
+                    "skipped_missing_images": skipped_missing_images,
+                }
+                return task_id
             raise ValueError("Nie znaleziono obrazow w wybranym datasecie.")
 
         normalized_items = [
@@ -341,6 +817,9 @@ class AppService:
             }
             for item in imported_items
         ]
+        total_images_to_import = len(normalized_items)
+        if progress_callback is not None:
+            progress_callback(0, total_images_to_import, "Przygotowanie importu", 0)
 
         task_id = self.repository.create_task(
             project_id,
@@ -351,9 +830,15 @@ class AppService:
         try:
             images = self.repository.list_images(task_id)
             image_id_by_path = {str(Path(image.file_path).resolve()): image.id for image in images}
+            imported_annotations = 0
+            completed_images = 0
             for item in normalized_items:
+                image_path = str(Path(item["image_path"]).resolve())
                 image_id = image_id_by_path.get(str(Path(item["image_path"]).resolve()))
                 if image_id is None:
+                    completed_images += 1
+                    if progress_callback is not None:
+                        progress_callback(completed_images, total_images_to_import, Path(image_path).name, imported_annotations)
                     continue
                 for annotation in item["annotations"]:
                     self._store_annotation(
@@ -363,6 +848,13 @@ class AppService:
                         annotation_definition=annotation.get("annotation_definition"),
                         source="import",
                     )
+                    imported_annotations += 1
+                completed_images += 1
+                if progress_callback is not None:
+                    progress_callback(completed_images, total_images_to_import, Path(image_path).name, imported_annotations)
+            self._last_dataset_import_report = {
+                "skipped_missing_images": skipped_missing_images,
+            }
             return task_id
         except Exception:
             self.repository.delete_task(task_id)
@@ -388,7 +880,46 @@ class AppService:
             raise ValueError("Wybierz przynajmniej jedno zdjęcie do importu.")
         return resolved_paths
 
-    def _extract_video_frames(self, project_id: int, task_name: str, video_path: str, frame_stride: int) -> list[str]:
+    def _normalize_path_list(self, values: list[str] | None) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_value in values or []:
+            candidate = str(raw_value).strip()
+            if not candidate:
+                continue
+            resolved_key = str(Path(candidate).resolve())
+            if resolved_key in seen:
+                continue
+            seen.add(resolved_key)
+            normalized.append(candidate)
+        return normalized
+
+    def _estimate_saved_video_frames(self, video_path: str, frame_stride: int) -> int:
+        if frame_stride < 1 or cv2 is None:
+            return 0
+        source_path = Path(video_path)
+        if not source_path.exists() or not source_path.is_file():
+            return 0
+        capture = cv2.VideoCapture(str(source_path))
+        if not capture.isOpened():
+            capture.release()
+            return 0
+        try:
+            estimated_total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if estimated_total_frames <= 0:
+                return 0
+            return max(1, (estimated_total_frames + frame_stride - 1) // frame_stride)
+        finally:
+            capture.release()
+
+    def _extract_video_frames(
+        self,
+        project_id: int,
+        task_name: str,
+        video_path: str,
+        frame_stride: int,
+        progress_callback: Callable[[int, int, str, int], None] | None = None,
+    ) -> list[str]:
         if frame_stride < 1:
             raise ValueError("Odstęp między klatkami musi być dodatni.")
         source_path = Path(video_path)
@@ -409,6 +940,13 @@ class AppService:
             shutil.rmtree(frames_dir, ignore_errors=True)
             raise ValueError("Nie udalo sie otworzyc pliku wideo.")
 
+        estimated_total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        estimated_saved_frames = 0
+        if estimated_total_frames > 0:
+            estimated_saved_frames = max(1, (estimated_total_frames + frame_stride - 1) // frame_stride)
+        if progress_callback is not None:
+            progress_callback(0, estimated_saved_frames, "Przygotowanie importu klatek", 0)
+
         saved_paths: list[str] = []
         frame_index = 0
         saved_index = 0
@@ -423,6 +961,9 @@ class AppService:
                         raise ValueError("Nie udalo sie zapisac klatek z wideo.")
                     saved_paths.append(str(frame_path))
                     saved_index += 1
+                    if progress_callback is not None:
+                        display_total = estimated_saved_frames if estimated_saved_frames > 0 else max(saved_index, 1)
+                        progress_callback(saved_index, display_total, frame_path.name, 0)
                 frame_index += 1
         finally:
             capture.release()
@@ -430,6 +971,9 @@ class AppService:
         if not saved_paths:
             shutil.rmtree(frames_dir, ignore_errors=True)
             raise ValueError("Nie udalo sie wyciac zadnych klatek z wybranego wideo.")
+        if progress_callback is not None:
+            final_total = estimated_saved_frames if estimated_saved_frames > 0 else max(len(saved_paths), 1)
+            progress_callback(len(saved_paths), final_total, "Import klatek zakonczony", 0)
         return saved_paths
 
     def get_task_workspace(self, task_id: int) -> dict:
@@ -2538,6 +3082,7 @@ class AppService:
         dataset_root: Path,
         dataset_format: str,
         project_labels: list[LabelTemplate],
+        allowed_label_names: set[str] | None = None,
     ) -> list[dict[str, object]]:
         label_lookup = self._build_import_label_lookup(project_labels)
         parsers = {
@@ -2551,64 +3096,187 @@ class AppService:
         parser = parsers.get(dataset_format)
         if parser is None:
             raise ValueError(f"Import formatu '{dataset_format}' nie jest obslugiwany.")
-        return parser(dataset_root, label_lookup)
+        return parser(dataset_root, label_lookup, allowed_label_names=allowed_label_names)
 
-    def _load_coco_like_dataset(self, dataset_root: Path, label_lookup: dict[str, LabelTemplate]) -> list[dict[str, object]]:
-        annotation_file = dataset_root / "annotations_coco.json"
-        if not annotation_file.exists():
-            raise ValueError("W wybranym folderze nie znaleziono pliku annotations_coco.json.")
-        payload = json.loads(annotation_file.read_text(encoding="utf-8"))
-        images_by_id: dict[int, dict[str, object]] = {}
-        for image in payload.get("images", []):
-            if not isinstance(image, dict) or not isinstance(image.get("id"), int):
-                continue
-            image_path = self._resolve_import_image_path(
-                dataset_root,
-                image.get("path"),
-                image.get("file_name"),
-                image.get("split"),
-            )
-            images_by_id[image["id"]] = {"image_path": image_path, "annotations": []}
+    def _load_coco_like_dataset(
+        self,
+        dataset_root: Path,
+        label_lookup: dict[str, LabelTemplate],
+        allowed_label_names: set[str] | None = None,
+    ) -> list[dict[str, object]]:
+        annotation_files = self._find_coco_like_annotation_files(dataset_root)
+        items_by_path: dict[str, dict[str, object]] = {}
 
-        for annotation in payload.get("annotations", []):
-            if not isinstance(annotation, dict):
-                continue
-            image_entry = images_by_id.get(annotation.get("image_id"))
-            if image_entry is None:
-                continue
-            label_name = str(annotation.get("label_name") or "")
-            if not label_name:
-                continue
-            label = self._resolve_import_label(label_lookup, label_name)
-            definition = annotation.get("raw_definition") if isinstance(annotation.get("raw_definition"), dict) else None
-            if definition is None and label.label_type == "Klasyfikacja":
-                definition = None
-            if definition is None and label.label_type != "Klasyfikacja":
-                raise ValueError(
-                    f"Brakuje geometrii dla etykiety '{label_name}' w COCO-like JSON. "
-                    + self._format_expected_received(f"raw_definition dla typu {label.label_type}", "brak")
+        for annotation_file in annotation_files:
+            payload = json.loads(annotation_file.read_text(encoding="utf-8"))
+            categories_by_id = {
+                int(category["id"]): str(category.get("name") or "")
+                for category in payload.get("categories", [])
+                if isinstance(category, dict) and isinstance(category.get("id"), int)
+            }
+
+            images_by_id: dict[int, dict[str, object]] = {}
+            for image in payload.get("images", []):
+                if not isinstance(image, dict) or not isinstance(image.get("id"), int):
+                    continue
+                image_path = self._try_resolve_import_image_path(
+                    dataset_root,
+                    image.get("path"),
+                    image.get("file_name"),
+                    image.get("split"),
                 )
-            image_entry["annotations"].append(
-                {
-                    "label_template_id": label.id,
-                    "annotation_definition": definition,
-                    "note": str(annotation.get("note") or ""),
+                if image_path is None:
+                    continue
+                image_key = str(image_path)
+                items_by_path.setdefault(image_key, {"image_path": image_path, "annotations": []})
+                images_by_id[image["id"]] = {
+                    "image_path": image_path,
+                    "width": int(image.get("width") or 0),
+                    "height": int(image.get("height") or 0),
                 }
+
+            for annotation in payload.get("annotations", []):
+                if not isinstance(annotation, dict):
+                    continue
+                image_entry = images_by_id.get(annotation.get("image_id"))
+                if image_entry is None:
+                    continue
+                label_name = str(annotation.get("label_name") or "").strip()
+                if not label_name and isinstance(annotation.get("category_id"), int):
+                    label_name = str(categories_by_id.get(int(annotation["category_id"]), "")).strip()
+                if not label_name:
+                    continue
+                if allowed_label_names is not None and label_name.casefold() not in allowed_label_names:
+                    continue
+                label = self._resolve_import_label(label_lookup, label_name)
+                definition = annotation.get("raw_definition") if isinstance(annotation.get("raw_definition"), dict) else None
+                if definition is None and label.label_type != "Klasyfikacja":
+                    include_keypoints = isinstance(annotation.get("keypoints"), list) and len(annotation.get("keypoints") or []) >= 3
+                    definition = self._build_import_definition_from_coco_annotation(
+                        annotation=annotation,
+                        label=label,
+                        image_width=int(image_entry.get("width") or 0),
+                        image_height=int(image_entry.get("height") or 0),
+                        include_keypoints=include_keypoints,
+                    )
+                if definition is None and label.label_type == "Klasyfikacja":
+                    definition = None
+                if definition is None and label.label_type != "Klasyfikacja":
+                    raise ValueError(
+                        f"Brakuje geometrii dla etykiety '{label_name}' w COCO-like JSON. "
+                        + self._format_expected_received(f"raw_definition dla typu {label.label_type}", "brak")
+                    )
+                image_key = str(image_entry["image_path"])
+                items_by_path.setdefault(image_key, {"image_path": image_entry["image_path"], "annotations": []})[
+                    "annotations"
+                ].append(
+                    {
+                        "label_template_id": label.id,
+                        "annotation_definition": definition,
+                        "note": str(annotation.get("note") or ""),
+                    }
+                )
+
+        return list(items_by_path.values())
+
+    def _find_coco_like_annotation_files(self, dataset_root: Path) -> list[Path]:
+        candidate_dirs = [
+            dataset_root,
+            dataset_root / "train",
+            dataset_root / "valid",
+            dataset_root / "test",
+        ]
+
+        json_candidates_with_priority: list[tuple[int, Path]] = []
+        seen_paths: set[str] = set()
+        for priority, folder in enumerate(candidate_dirs):
+            if not folder.exists() or not folder.is_dir():
+                continue
+            for path in sorted(folder.rglob("*.json")):
+                if not path.is_file():
+                    continue
+                # Root scan already includes split subfolders; avoid importing the same file multiple times.
+                normalized_path = str(path.resolve()).casefold()
+                if normalized_path in seen_paths:
+                    continue
+                seen_paths.add(normalized_path)
+                json_candidates_with_priority.append((priority, path))
+
+        if not json_candidates_with_priority:
+            raise ValueError(
+                "W wybranym folderze nie znaleziono plikow .json z annotacjami COCO-like "
+                "w katalogu glownym ani w train, valid i test."
             )
 
-        return list(images_by_id.values())
+        parsed_candidates: list[tuple[int, Path, dict[str, object]]] = []
+        for priority, candidate in json_candidates_with_priority:
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict):
+                parsed_candidates.append((priority, candidate, payload))
 
-    def _load_coco_dataset(self, dataset_root: Path, label_lookup: dict[str, LabelTemplate]) -> list[dict[str, object]]:
+        with_images_and_annotations = sorted(
+            (
+                (priority, candidate)
+                for priority, candidate, payload in parsed_candidates
+                if isinstance(payload.get("images"), list) and isinstance(payload.get("annotations"), list)
+            ),
+            key=lambda item: (item[0], str(item[1]).casefold()),
+        )
+        if with_images_and_annotations:
+            return [candidate for _, candidate in with_images_and_annotations]
+
+        with_annotations = sorted(
+            (
+                (priority, candidate)
+                for priority, candidate, payload in parsed_candidates
+                if isinstance(payload.get("annotations"), list)
+            ),
+            key=lambda item: (item[0], str(item[1]).casefold()),
+        )
+        if with_annotations:
+            return [candidate for _, candidate in with_annotations]
+
+        return [sorted(json_candidates_with_priority, key=lambda item: (item[0], str(item[1]).casefold()))[0][1]]
+
+    def _find_coco_like_annotation_file(self, dataset_root: Path) -> Path:
+        return self._find_coco_like_annotation_files(dataset_root)[0]
+
+    def _load_coco_dataset(
+        self,
+        dataset_root: Path,
+        label_lookup: dict[str, LabelTemplate],
+        allowed_label_names: set[str] | None = None,
+    ) -> list[dict[str, object]]:
         annotation_files = sorted((dataset_root / "annotations").glob("instances_*.json"))
         if not annotation_files:
             raise ValueError("W wybranym folderze nie znaleziono plikow instances_<split>.json.")
-        return self._load_coco_family_dataset(dataset_root, label_lookup, annotation_files, keypoints=False)
+        return self._load_coco_family_dataset(
+            dataset_root,
+            label_lookup,
+            annotation_files,
+            keypoints=False,
+            allowed_label_names=allowed_label_names,
+        )
 
-    def _load_coco_keypoints_dataset(self, dataset_root: Path, label_lookup: dict[str, LabelTemplate]) -> list[dict[str, object]]:
+    def _load_coco_keypoints_dataset(
+        self,
+        dataset_root: Path,
+        label_lookup: dict[str, LabelTemplate],
+        allowed_label_names: set[str] | None = None,
+    ) -> list[dict[str, object]]:
         annotation_files = sorted((dataset_root / "annotations").glob("person_keypoints_*.json"))
         if not annotation_files:
             raise ValueError("W wybranym folderze nie znaleziono plikow person_keypoints_<split>.json.")
-        return self._load_coco_family_dataset(dataset_root, label_lookup, annotation_files, keypoints=True)
+        return self._load_coco_family_dataset(
+            dataset_root,
+            label_lookup,
+            annotation_files,
+            keypoints=True,
+            allowed_label_names=allowed_label_names,
+        )
 
     def _load_coco_family_dataset(
         self,
@@ -2616,6 +3284,7 @@ class AppService:
         label_lookup: dict[str, LabelTemplate],
         annotation_files: list[Path],
         keypoints: bool,
+        allowed_label_names: set[str] | None = None,
     ) -> list[dict[str, object]]:
         items_by_path: dict[str, dict[str, object]] = {}
         for annotation_file in annotation_files:
@@ -2632,12 +3301,14 @@ class AppService:
                 if isinstance(image, dict) and isinstance(image.get("id"), int)
             }
             for image in images.values():
-                image_path = self._resolve_import_image_path(
+                image_path = self._try_resolve_import_image_path(
                     dataset_root,
                     None,
                     image.get("file_name"),
                     split_name,
                 )
+                if image_path is None:
+                    continue
                 items_by_path.setdefault(str(image_path), {"image_path": str(image_path), "annotations": []})
 
             for annotation in payload.get("annotations", []):
@@ -2647,8 +3318,12 @@ class AppService:
                 label_name = categories.get(annotation.get("category_id"))
                 if image_info is None or not label_name:
                     continue
+                if allowed_label_names is not None and label_name.casefold() not in allowed_label_names:
+                    continue
                 label = self._resolve_import_label(label_lookup, label_name)
-                image_path = self._resolve_import_image_path(dataset_root, None, image_info.get("file_name"), split_name)
+                image_path = self._try_resolve_import_image_path(dataset_root, None, image_info.get("file_name"), split_name)
+                if image_path is None:
+                    continue
                 definition = self._build_import_definition_from_coco_annotation(
                     annotation=annotation,
                     label=label,
@@ -2665,7 +3340,12 @@ class AppService:
                 )
         return list(items_by_path.values())
 
-    def _load_pascal_voc_dataset(self, dataset_root: Path, label_lookup: dict[str, LabelTemplate]) -> list[dict[str, object]]:
+    def _load_pascal_voc_dataset(
+        self,
+        dataset_root: Path,
+        label_lookup: dict[str, LabelTemplate],
+        allowed_label_names: set[str] | None = None,
+    ) -> list[dict[str, object]]:
         annotations_dir = dataset_root / "Annotations"
         xml_files = sorted(annotations_dir.glob("*.xml"))
         if not xml_files:
@@ -2677,11 +3357,15 @@ class AppService:
             filename = root.findtext("filename")
             width = int(root.findtext("size/width") or 0)
             height = int(root.findtext("size/height") or 0)
-            image_path = self._resolve_import_image_path(dataset_root, None, filename, None)
+            image_path = self._try_resolve_import_image_path(dataset_root, None, filename, None)
+            if image_path is None:
+                continue
             annotations: list[dict[str, object]] = []
             for obj in root.findall("object"):
                 label_name = obj.findtext("name") or ""
                 if not label_name:
+                    continue
+                if allowed_label_names is not None and label_name.casefold() not in allowed_label_names:
                     continue
                 label = self._resolve_import_label(label_lookup, label_name)
                 if label.label_type != "Bounding box":
@@ -2709,7 +3393,12 @@ class AppService:
             items.append({"image_path": str(image_path), "annotations": annotations})
         return items
 
-    def _load_imagenet_dataset(self, dataset_root: Path, label_lookup: dict[str, LabelTemplate]) -> list[dict[str, object]]:
+    def _load_imagenet_dataset(
+        self,
+        dataset_root: Path,
+        label_lookup: dict[str, LabelTemplate],
+        allowed_label_names: set[str] | None = None,
+    ) -> list[dict[str, object]]:
         synsets_path = dataset_root / "synsets.txt"
         if synsets_path.exists():
             label_names = [line.strip() for line in synsets_path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -2733,13 +3422,17 @@ class AppService:
                     label_name = class_names_by_index.get(class_index)
                     if label_name is None:
                         raise ValueError(f"Nie znaleziono klasy o indeksie {class_index} w synsets.txt.")
+                    if allowed_label_names is not None and label_name.casefold() not in allowed_label_names:
+                        continue
                     label = self._resolve_import_label(label_lookup, label_name)
                     if label.label_type != "Klasyfikacja":
                         raise ValueError(
                             f"Import ImageNet nie moze uzyc etykiety '{label_name}'. "
                             + self._format_expected_received("Klasyfikacja", label.label_type)
                         )
-                    image_path = self._resolve_import_image_path(dataset_root, relative_path, None, None)
+                    image_path = self._try_resolve_import_image_path(dataset_root, relative_path, None, None)
+                    if image_path is None:
+                        continue
                     items.append(
                         {
                             "image_path": str(image_path),
@@ -2784,7 +3477,12 @@ class AppService:
             raise ValueError("Nie znaleziono danych ImageNet do importu.")
         return items
 
-    def _load_yolo_pose_dataset(self, dataset_root: Path, label_lookup: dict[str, LabelTemplate]) -> list[dict[str, object]]:
+    def _load_yolo_pose_dataset(
+        self,
+        dataset_root: Path,
+        label_lookup: dict[str, LabelTemplate],
+        allowed_label_names: set[str] | None = None,
+    ) -> list[dict[str, object]]:
         metadata = self._read_ultralytics_data_yaml(dataset_root)
         class_names_by_index = metadata["names"]
         split_entries = self._read_ultralytics_split_entries(dataset_root, metadata)
@@ -2792,13 +3490,40 @@ class AppService:
             raise ValueError("W wybranym folderze nie znaleziono wpisow YOLO Pose do importu.")
         items: list[dict[str, object]] = []
         for split_name, image_relative_path in split_entries:
-            image_path = self._resolve_import_image_path(dataset_root, image_relative_path, None, None)
+            image_path = self._try_resolve_import_image_path(dataset_root, image_relative_path, None, None)
+            if image_path is None:
+                continue
             label_path = self._resolve_ultralytics_label_path(dataset_root, split_name, image_relative_path)
             annotations: list[dict[str, object]] = []
             if label_path.exists():
-                annotations = self._load_yolo_pose_annotations(label_path, label_lookup, class_names_by_index)
+                annotations = self._load_yolo_pose_annotations(
+                    label_path,
+                    label_lookup,
+                    class_names_by_index,
+                    allowed_label_names=allowed_label_names,
+                )
             items.append({"image_path": str(image_path), "annotations": annotations})
         return items
+
+    def _try_resolve_import_image_path(
+        self,
+        dataset_root: Path,
+        raw_path: object,
+        file_name: object,
+        split_name: object,
+    ) -> Path | None:
+        try:
+            return self._resolve_import_image_path(dataset_root, raw_path, file_name, split_name)
+        except ValueError:
+            self._record_missing_dataset_image(raw_path, file_name, split_name)
+            return None
+
+    def _record_missing_dataset_image(self, raw_path: object, file_name: object, split_name: object) -> None:
+        split_part = str(split_name or "").strip()
+        file_part = str(file_name or "").strip()
+        raw_part = str(raw_path or "").strip()
+        key = f"{split_part}|{file_part}|{raw_part}".casefold()
+        self._missing_dataset_image_keys.add(key)
 
     def _read_ultralytics_data_yaml(self, dataset_root: Path) -> dict[str, object]:
         data_yaml = dataset_root / "data.yaml"
@@ -2884,6 +3609,7 @@ class AppService:
         label_path: Path,
         label_lookup: dict[str, LabelTemplate],
         class_names_by_index: dict[int, str],
+        allowed_label_names: set[str] | None = None,
     ) -> list[dict[str, object]]:
         annotations: list[dict[str, object]] = []
         for line_number, raw_line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -2905,6 +3631,8 @@ class AppService:
             label_name = class_names_by_index.get(class_id)
             if not label_name:
                 raise ValueError(f"Klasa {class_id} z {label_path.name}:{line_number} nie istnieje w data.yaml.")
+            if allowed_label_names is not None and label_name.casefold() not in allowed_label_names:
+                continue
             label = self._resolve_import_label(label_lookup, label_name)
             if label.label_type not in {"Skeleton", "Point"}:
                 raise ValueError(
@@ -3008,8 +3736,47 @@ class AppService:
         for candidate in candidates:
             if candidate.exists() and candidate.is_file():
                 return candidate.resolve()
+
+        # Fallback: some COCO variants store images in split subfolders but omit split/path in JSON.
+        fallback_name = ""
+        if isinstance(file_name, str) and file_name.strip():
+            fallback_name = Path(file_name).name
+        elif isinstance(raw_path, str) and raw_path.strip():
+            fallback_name = Path(raw_path).name
+
+        if fallback_name:
+            image_name_index = self._get_dataset_image_name_index(dataset_root)
+            matched_paths = image_name_index.get(fallback_name.casefold(), [])
+            if matched_paths:
+                if isinstance(split_name, str) and split_name.strip():
+                    split_token = split_name.strip().casefold()
+                    split_matches = [
+                        path
+                        for path in matched_paths
+                        if split_token in {part.casefold() for part in path.parts}
+                    ]
+                    if split_matches:
+                        return split_matches[0].resolve()
+                return matched_paths[0].resolve()
+
         target_name = str(file_name or raw_path or "obrazu")
         raise ValueError(f"Nie znaleziono pliku obrazu dla wpisu '{target_name}' w datasecie.")
+
+    def _get_dataset_image_name_index(self, dataset_root: Path) -> dict[str, list[Path]]:
+        cache_key = str(dataset_root.resolve())
+        cached = self._dataset_image_name_index_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        index: dict[str, list[Path]] = {}
+        for path in sorted(dataset_root.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in self.IMAGE_EXTENSIONS:
+                continue
+            key = path.name.casefold()
+            index.setdefault(key, []).append(path)
+
+        self._dataset_image_name_index_cache[cache_key] = index
+        return index
 
     def _build_import_definition_from_coco_annotation(
         self,

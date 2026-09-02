@@ -83,6 +83,7 @@ class DatabaseManager:
                     window_width INTEGER NOT NULL,
                     window_height INTEGER NOT NULL,
                     last_model_config_json TEXT,
+                    last_task_dialog_config_json TEXT,
                     updated_at TEXT NOT NULL
                 );
                 """
@@ -91,6 +92,7 @@ class DatabaseManager:
             self._ensure_column(connection, "label_templates", "preview_definition_json", "TEXT")
             self._ensure_column(connection, "annotations", "annotation_definition_json", "TEXT")
             self._ensure_column(connection, "app_sessions", "last_model_config_json", "TEXT")
+            self._ensure_column(connection, "app_sessions", "last_task_dialog_config_json", "TEXT")
 
     def _ensure_column(self, connection: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
         columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()}

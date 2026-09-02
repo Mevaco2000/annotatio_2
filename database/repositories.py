@@ -570,9 +570,10 @@ class AppRepository:
                     window_width,
                     window_height,
                     last_model_config_json,
+                    last_task_dialog_config_json,
                     updated_at
                 )
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     last_page = excluded.last_page,
                     last_project_id = excluded.last_project_id,
@@ -580,6 +581,7 @@ class AppRepository:
                     window_width = excluded.window_width,
                     window_height = excluded.window_height,
                     last_model_config_json = excluded.last_model_config_json,
+                    last_task_dialog_config_json = excluded.last_task_dialog_config_json,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -589,6 +591,9 @@ class AppRepository:
                     session.window_width,
                     session.window_height,
                     json.dumps(session.last_model_config, ensure_ascii=False) if session.last_model_config is not None else None,
+                    json.dumps(session.last_task_dialog_config, ensure_ascii=False)
+                    if session.last_task_dialog_config is not None
+                    else None,
                     timestamp,
                 ),
             )
@@ -596,7 +601,7 @@ class AppRepository:
     def load_session_state(self) -> SessionState:
         with self.database.connect() as connection:
             row = connection.execute(
-                "SELECT last_page, last_project_id, last_task_id, window_width, window_height, last_model_config_json FROM app_sessions WHERE id = 1"
+                "SELECT last_page, last_project_id, last_task_id, window_width, window_height, last_model_config_json, last_task_dialog_config_json FROM app_sessions WHERE id = 1"
             ).fetchone()
 
         if row is None:
@@ -609,6 +614,8 @@ class AppRepository:
             window_width=row["window_width"],
             window_height=row["window_height"],
             last_model_config=json.loads(row["last_model_config_json"]) if row["last_model_config_json"] else None,
+            last_task_dialog_config=
+            json.loads(row["last_task_dialog_config_json"]) if row["last_task_dialog_config_json"] else None,
         )
 
     def _touch_from_image(self, connection, image_id: int) -> None:

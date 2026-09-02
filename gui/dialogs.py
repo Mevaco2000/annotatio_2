@@ -14,6 +14,20 @@ except ImportError:
     ImageTk = None
 
 
+def center_window_on_screen(window: tk.Toplevel) -> None:
+    try:
+        window.update_idletasks()
+        width = max(window.winfo_reqwidth(), window.winfo_width(), 320)
+        height = max(window.winfo_reqheight(), window.winfo_height(), 180)
+        screen_width = window.winfo_screenwidth()
+        screen_height = window.winfo_screenheight()
+        pos_x = max(0, (screen_width - width) // 2)
+        pos_y = max(0, (screen_height - height) // 2)
+        window.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+    except tk.TclError:
+        return
+
+
 class BaseDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, title: str) -> None:
         super().__init__(parent)
@@ -23,6 +37,7 @@ class BaseDialog(tk.Toplevel):
         self.resizable(False, False)
         self.result = None
         self.columnconfigure(0, weight=1)
+        self.after_idle(lambda: center_window_on_screen(self))
 
     def show(self):
         self.wait_window(self)
@@ -285,6 +300,118 @@ class ExportDialog(BaseDialog):
         self.destroy()
 
 
+class ImportDatasetDialog(BaseDialog):
+    def __init__(self, parent: tk.Misc, import_formats: list[str] | None = None) -> None:
+        super().__init__(parent, "Import Dataset")
+        self.import_formats = list(import_formats or AppService.DATASET_IMPORT_FORMATS)
+        default_format = self.import_formats[0] if self.import_formats else ""
+        self.task_name_var = tk.StringVar()
+        self.dataset_folder_var = tk.StringVar()
+        self.format_var = tk.StringVar(value=default_format)
+        self._build()
+
+    def _build(self) -> None:
+        body = ttk.Frame(self, padding=16)
+        body.grid(sticky="nsew")
+        body.columnconfigure(1, weight=1)
+
+        ttk.Label(body, text="Nazwa taska (opcjonalnie)").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        ttk.Entry(body, textvariable=self.task_name_var, width=36).grid(row=0, column=1, sticky="ew", pady=(0, 8))
+
+        ttk.Label(body, text="Folder datasetu").grid(row=1, column=0, sticky="w", pady=(0, 8))
+        ttk.Entry(body, textvariable=self.dataset_folder_var, width=36).grid(row=1, column=1, sticky="ew", pady=(0, 8))
+        ttk.Button(body, text="Wybierz folder", command=self._pick_directory).grid(row=1, column=2, padx=(8, 0), pady=(0, 8))
+
+        ttk.Label(body, text="Format annotacji").grid(row=2, column=0, sticky="w", pady=(0, 8))
+        ttk.Combobox(body, textvariable=self.format_var, values=self.import_formats, state="readonly").grid(
+            row=2,
+            column=1,
+            sticky="ew",
+            pady=(0, 8),
+        )
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=3, column=0, columnspan=3, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="Anuluj", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(buttons, text="Importuj", command=self._save).pack(side="right")
+
+    def _pick_directory(self) -> None:
+        folder = filedialog.askdirectory(parent=self, title="Wybierz folder datasetu")
+        if folder:
+            self.dataset_folder_var.set(folder)
+            if not self.task_name_var.get().strip():
+                self.task_name_var.set(Path(folder).name)
+
+    def _save(self) -> None:
+        task_name = self.task_name_var.get().strip()
+        dataset_folder = self.dataset_folder_var.get().strip()
+        dataset_format = self.format_var.get().strip()
+
+        if not dataset_folder:
+            messagebox.showerror("Import Dataset", "Wybierz folder datasetu.", parent=self)
+            return
+        if not dataset_format:
+            messagebox.showerror("Import Dataset", "Wybierz format annotacji.", parent=self)
+            return
+
+        self.result = {
+            "task_name": task_name,
+            "dataset_folder": dataset_folder,
+            "dataset_format": dataset_format,
+        }
+        self.destroy()
+
+
+class ImportTypeFilterDialog(BaseDialog):
+    def __init__(self, parent: tk.Misc, detected_types: list[str]) -> None:
+        super().__init__(parent, "Filtr typow etykiet")
+        unique_types: list[str] = []
+        for label_type in detected_types:
+            if label_type not in unique_types:
+                unique_types.append(label_type)
+        self.detected_types = unique_types
+        self.type_vars: dict[str, tk.BooleanVar] = {
+            label_type: tk.BooleanVar(value=True) for label_type in self.detected_types
+        }
+        self._build()
+
+    def _build(self) -> None:
+        body = ttk.Frame(self, padding=16)
+        body.grid(sticky="nsew")
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(body, text="Wykryto wiele typow etykiet. Wybierz, co importowac:").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            pady=(0, 10),
+        )
+
+        checks = ttk.Frame(body)
+        checks.grid(row=1, column=0, sticky="ew")
+        checks.columnconfigure(0, weight=1)
+        for index, label_type in enumerate(self.detected_types):
+            ttk.Checkbutton(checks, text=label_type, variable=self.type_vars[label_type]).grid(
+                row=index,
+                column=0,
+                sticky="w",
+                pady=(0, 4),
+            )
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=2, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Anuluj", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(buttons, text="Importuj", command=self._save).pack(side="right")
+
+    def _save(self) -> None:
+        selected_types = [label_type for label_type, flag in self.type_vars.items() if flag.get()]
+        if not selected_types:
+            messagebox.showwarning("Import Dataset", "Wybierz przynajmniej jeden typ etykiety.", parent=self)
+            return
+        self.result = {"allowed_label_types": selected_types}
+        self.destroy()
+
+
 class CreateTaskDialog(BaseDialog):
     def __init__(self, parent: tk.Misc) -> None:
         super().__init__(parent, "Create New Task")
@@ -370,6 +497,106 @@ class MergeDialog(BaseDialog):
             if item_label == label:
                 return item_id
         raise ValueError("Nie znaleziono wybranego elementu.")
+
+
+class MergeProjectsDialog(BaseDialog):
+    def __init__(self, parent: tk.Misc, options: list[tuple[int, str]]) -> None:
+        super().__init__(parent, "Scal projekty")
+        self.options = options
+        self.target_var = tk.StringVar(value=options[0][1] if options else "")
+        self.delete_sources_var = tk.BooleanVar(value=False)
+        self._build()
+
+    def _build(self) -> None:
+        body = ttk.Frame(self, padding=16)
+        body.grid(sticky="nsew")
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(body, text="Projekt docelowy").grid(row=0, column=0, sticky="w")
+        self.target_combo = ttk.Combobox(
+            body,
+            textvariable=self.target_var,
+            values=[label for _, label in self.options],
+            state="readonly",
+            width=42,
+        )
+        self.target_combo.grid(row=1, column=0, sticky="ew", pady=(4, 12))
+
+        ttk.Label(body, text="Projekty zrodlowe do scalenia (mozesz wybrac wiele)").grid(row=2, column=0, sticky="w")
+        list_wrap = ttk.Frame(body)
+        list_wrap.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
+        list_wrap.columnconfigure(0, weight=1)
+        list_wrap.rowconfigure(0, weight=1)
+
+        self.sources_list = tk.Listbox(list_wrap, selectmode=tk.MULTIPLE, height=10, exportselection=False)
+        self.sources_list.grid(row=0, column=0, sticky="nsew")
+        for _, label in self.options:
+            self.sources_list.insert(tk.END, label)
+
+        scrollbar = ttk.Scrollbar(list_wrap, orient="vertical", command=self.sources_list.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.sources_list.configure(yscrollcommand=scrollbar.set)
+
+        quick_actions = ttk.Frame(body)
+        quick_actions.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(quick_actions, text="Wybierz wszystkie", command=self._select_all_sources).pack(side="left")
+        ttk.Button(quick_actions, text="Wyczysc wybor", command=self._clear_sources).pack(side="left", padx=(8, 0))
+
+        ttk.Checkbutton(
+            body,
+            text="Usun projekty zrodlowe po udanym scaleniu",
+            variable=self.delete_sources_var,
+        ).grid(row=5, column=0, sticky="w", pady=(10, 0))
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=6, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Anuluj", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(buttons, text="Scal", command=self._save).pack(side="right")
+
+    def _select_all_sources(self) -> None:
+        self.sources_list.selection_set(0, tk.END)
+
+    def _clear_sources(self) -> None:
+        self.sources_list.selection_clear(0, tk.END)
+
+    def _save(self) -> None:
+        target_label = self.target_var.get().strip()
+        if not target_label:
+            messagebox.showwarning("Scalanie projektow", "Wybierz projekt docelowy.", parent=self)
+            return
+
+        selected_indexes = list(self.sources_list.curselection())
+        if not selected_indexes:
+            messagebox.showwarning("Scalanie projektow", "Wybierz przynajmniej jeden projekt zrodlowy.", parent=self)
+            return
+
+        options_by_label = {label: item_id for item_id, label in self.options}
+        target_id = options_by_label.get(target_label)
+        if target_id is None:
+            messagebox.showwarning("Scalanie projektow", "Nie znaleziono wybranego projektu docelowego.", parent=self)
+            return
+
+        source_ids: list[int] = []
+        for index in selected_indexes:
+            source_label = self.sources_list.get(index)
+            source_id = options_by_label.get(source_label)
+            if source_id is not None and source_id != target_id:
+                source_ids.append(source_id)
+
+        if not source_ids:
+            messagebox.showwarning(
+                "Scalanie projektow",
+                "Lista projektow zrodlowych po odfiltrowaniu projektu docelowego jest pusta.",
+                parent=self,
+            )
+            return
+
+        self.result = {
+            "target_id": target_id,
+            "source_ids": source_ids,
+            "delete_sources": bool(self.delete_sources_var.get()),
+        }
+        self.destroy()
 
 
 class CreateLabelDialog(BaseDialog):
@@ -1170,6 +1397,16 @@ class BatchProgressDialog(tk.Toplevel):
         ttk.Label(body, textvariable=self.counter_var).grid(row=2, column=0, sticky="w")
         ttk.Label(body, textvariable=self.details_var, justify="left", wraplength=420).grid(row=3, column=0, sticky="w", pady=(8, 0))
 
+        self.after_idle(lambda: center_window_on_screen(self))
+        self._refresh()
+
+    def set_indeterminate(self, enabled: bool) -> None:
+        if enabled:
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(10)
+        else:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
         self._refresh()
 
     def update_progress(self, completed_steps: int, current_image_name: str, total_annotations: int) -> None:
@@ -1186,6 +1423,7 @@ class BatchProgressDialog(tk.Toplevel):
 
     def close(self) -> None:
         if self.winfo_exists():
+            self.progress.stop()
             self.grab_release()
             self.destroy()
 
@@ -1400,16 +1638,42 @@ class CreateTaskDialog(BaseDialog):
         "Plik wideo": "video",
     }
 
-    def __init__(self, parent: tk.Misc) -> None:
+    def __init__(self, parent: tk.Misc, initial_config: dict[str, object] | None = None) -> None:
         super().__init__(parent, "Create New Task")
-        self.name_var = tk.StringVar()
-        self.source_path_var = tk.StringVar()
-        self.source_type_var = tk.StringVar(value=next(iter(self.IMPORT_SOURCE_OPTIONS)))
-        self.dataset_format_var = tk.StringVar(
-            value=AppService.DATASET_IMPORT_FORMATS[0] if AppService.DATASET_IMPORT_FORMATS else ""
+        self.resizable(True, True)
+        self.geometry("700x380")
+        self.minsize(620, 340)
+        initial_config = dict(initial_config or {})
+        default_source_type = next(iter(self.IMPORT_SOURCE_OPTIONS))
+        requested_source_type = str(initial_config.get("source_type") or "").strip()
+        initial_source_type = requested_source_type if requested_source_type in self.IMPORT_SOURCE_OPTIONS else default_source_type
+        requested_dataset_format = str(initial_config.get("dataset_format") or "").strip()
+        initial_dataset_format = (
+            requested_dataset_format
+            if requested_dataset_format in AppService.DATASET_IMPORT_FORMATS
+            else (AppService.DATASET_IMPORT_FORMATS[0] if AppService.DATASET_IMPORT_FORMATS else "")
         )
-        self.frame_stride_var = tk.IntVar(value=30)
+        try:
+            requested_stride = int(initial_config.get("frame_stride") or 30)
+        except (TypeError, ValueError):
+            requested_stride = 30
+        initial_stride = requested_stride if requested_stride >= 1 else 30
+
+        self.name_var = tk.StringVar()
+        self.source_path_var = tk.StringVar(value=str(initial_config.get("source_path") or ""))
+        self.source_type_var = tk.StringVar(value=initial_source_type)
+        self.dataset_format_var = tk.StringVar(value=initial_dataset_format)
+        self.frame_stride_var = tk.IntVar(value=initial_stride)
         self.images: list[str] = []
+        configured_source_paths = initial_config.get("source_paths")
+        self.source_paths: list[str] = [
+            str(path).strip()
+            for path in (configured_source_paths if isinstance(configured_source_paths, list) else [])
+            if str(path).strip()
+        ]
+        # Keep backward compatibility with older session payloads that stored only one source path.
+        if not self.source_paths and self.source_path_var.get().strip() and self._current_import_mode() in {"folder", "video"}:
+            self.source_paths = [self.source_path_var.get().strip()]
         self.selection_summary_var = tk.StringVar(value="Nie wybrano jeszcze źródła danych.")
         self._build()
 
@@ -1417,6 +1681,7 @@ class CreateTaskDialog(BaseDialog):
         container = ttk.Frame(self, padding=18)
         container.grid(sticky="nsew")
         container.columnconfigure(0, weight=1)
+        container.columnconfigure(1, weight=0)
 
         ttk.Label(container, text="Nazwa taska").grid(row=0, column=0, sticky="w")
         ttk.Entry(container, textvariable=self.name_var, width=40).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 12))
@@ -1461,57 +1726,93 @@ class CreateTaskDialog(BaseDialog):
         self.frame_stride_spinbox.grid(row=9, column=1, sticky="w", pady=(12, 0))
 
         actions = ttk.Frame(container)
-        actions.grid(row=10, column=0, columnspan=2, sticky="e", pady=(16, 0))
-        ttk.Button(actions, text="Anuluj", command=self._close).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(actions, text="Utwórz task", command=self._save).grid(row=0, column=1)
+        actions.grid(row=10, column=0, columnspan=2, pady=(16, 0))
+        ttk.Button(actions, text="Anuluj", command=self._close).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Utwórz task", command=self._save).pack(side="left")
 
         self._update_source_mode()
 
     def _browse_source(self) -> None:
         mode = self._current_import_mode()
         if mode == "video":
-            selected = filedialog.askopenfilename(
+            selected = filedialog.askopenfilenames(
                 parent=self,
-                title="Wybierz plik wideo",
+                title="Wybierz pliki wideo",
                 filetypes=[("Wideo", "*.mp4 *.avi *.mov *.mkv *.webm"), ("Wszystkie", "*.*")],
             )
             if not selected:
                 return
-            self.source_path_var.set(selected)
-            if not self.name_var.get().strip():
-                self.name_var.set(Path(selected).stem)
-            self.selection_summary_var.set(f"Wideo: {Path(selected).name}")
+            self.source_paths = self._merge_unique_paths(self.source_paths, list(selected))
+            self.source_path_var.set(self.source_paths[0] if self.source_paths else "")
+            if not self.name_var.get().strip() and self.source_paths:
+                self.name_var.set(Path(self.source_paths[0]).stem)
+            self._update_source_mode()
+            return
+
+        if mode == "folder":
+            directory = filedialog.askdirectory(
+                parent=self,
+                title="Wybierz folder ze zdjęciami",
+            )
+            if not directory:
+                return
+            self.source_paths = self._merge_unique_paths(self.source_paths, [directory])
+            self.source_path_var.set(self.source_paths[0] if self.source_paths else "")
+            if not self.name_var.get().strip() and self.source_paths:
+                self.name_var.set(Path(self.source_paths[0]).name)
+            self._update_source_mode()
             return
 
         directory = filedialog.askdirectory(
             parent=self,
-            title="Wybierz folder datasetu" if mode == "dataset" else "Wybierz folder ze zdjęciami",
+            title="Wybierz folder datasetu",
         )
         if not directory:
             return
+        self.source_paths = []
         self.source_path_var.set(directory)
         if not self.name_var.get().strip():
             self.name_var.set(Path(directory).name)
-        if mode == "dataset":
-            self.selection_summary_var.set(f"Dataset: {Path(directory).name} | format: {self.dataset_format_var.get()}")
-        else:
-            self.selection_summary_var.set(f"Folder zdjęć: {Path(directory).name}")
+        self._update_source_mode()
+
+    def _clear_selection(self) -> None:
+        mode = self._current_import_mode()
+        if mode == "images":
+            self.images = []
+        elif mode in {"folder", "video"}:
+            self.source_paths = []
+            self.source_path_var.set("")
+        elif mode == "dataset":
+            self.source_path_var.set("")
+        self._update_source_mode()
+
+    def _merge_unique_paths(self, existing: list[str], incoming: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for raw_path in [*existing, *incoming]:
+            candidate = str(raw_path).strip()
+            if not candidate:
+                continue
+            normalized = str(Path(candidate).resolve())
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(candidate)
+        return merged
 
     def _browse_images(self) -> None:
         selected = filedialog.askopenfilenames(
             parent=self,
-            title="Wybierz zdjęcia do pierwszego taska",
+            title="Wybierz zdjęcia do taska",
             filetypes=[("Obrazy", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"), ("Wszystkie", "*.*")],
         )
         if not selected:
             return
-        self.images = list(selected)
+        self.images = self._merge_unique_paths(self.images, list(selected))
         if not self.name_var.get().strip() and self.images:
             first_parent = Path(self.images[0]).parent.name
             self.name_var.set(first_parent or "task")
-        first_names = ", ".join(Path(path).name for path in self.images[:2])
-        suffix = "" if len(self.images) <= 2 else f" i jeszcze {len(self.images) - 2}"
-        self.selection_summary_var.set(f"Wybrano {len(self.images)} zdjęć: {first_names}{suffix}")
+        self._update_source_mode()
 
     def _current_import_mode(self) -> str:
         return self.IMPORT_SOURCE_OPTIONS.get(self.source_type_var.get(), "folder")
@@ -1524,15 +1825,15 @@ class CreateTaskDialog(BaseDialog):
         video_mode = mode == "video"
 
         if video_mode:
-            source_label_text = "Plik wideo"
+            source_label_text = "Pliki wideo"
         elif dataset_mode:
             source_label_text = "Folder datasetu"
         else:
-            source_label_text = "Folder ze zdjęciami"
+            source_label_text = "Foldery ze zdjęciami"
         self.source_label.configure(text=source_label_text)
-        self.source_entry.state(["!disabled"] if not image_mode else ["disabled"])
+        self.source_entry.state(["!disabled"] if dataset_mode else ["disabled"])
         self.source_button.state(["!disabled"] if not image_mode else ["disabled"])
-        self.images_button.state(["!disabled"] if image_mode else ["disabled"])
+        self.images_button.state(["!disabled"])
         if dataset_mode:
             self.dataset_format_label.grid()
             self.dataset_format_combo.grid()
@@ -1541,23 +1842,33 @@ class CreateTaskDialog(BaseDialog):
             self.dataset_format_combo.grid_remove()
 
         if video_mode:
-            self.source_button.configure(text="Wybierz wideo")
+            self.source_button.configure(text="Dodaj wideo")
+            self.images_button.configure(text="Wyczyść wybór", command=self._clear_selection)
             self.frame_stride_label.grid()
             self.frame_stride_spinbox.grid()
+        elif folder_mode:
+            self.source_button.configure(text="Dodaj folder")
+            self.images_button.configure(text="Wyczyść wybór", command=self._clear_selection)
+            self.frame_stride_label.grid_remove()
+            self.frame_stride_spinbox.grid_remove()
+        elif dataset_mode:
+            self.source_button.configure(text="Wybierz folder")
+            self.images_button.configure(text="Wyczyść wybór", command=self._clear_selection)
+            self.frame_stride_label.grid_remove()
+            self.frame_stride_spinbox.grid_remove()
         else:
             self.source_button.configure(text="Wybierz folder")
-            if image_mode:
-                self.frame_stride_label.grid_remove()
-                self.frame_stride_spinbox.grid_remove()
-            else:
-                self.frame_stride_label.grid_remove()
-                self.frame_stride_spinbox.grid_remove()
+            self.images_button.configure(text="Dodaj zdjęcia", command=self._browse_images)
+            self.frame_stride_label.grid_remove()
+            self.frame_stride_spinbox.grid_remove()
 
         if folder_mode:
-            if self.source_path_var.get().strip():
-                self.selection_summary_var.set(f"Folder zdjęć: {Path(self.source_path_var.get().strip()).name}")
+            if self.source_paths:
+                folder_names = ", ".join(Path(path).name for path in self.source_paths[:2])
+                suffix = "" if len(self.source_paths) <= 2 else f" i jeszcze {len(self.source_paths) - 2}"
+                self.selection_summary_var.set(f"Wybrano {len(self.source_paths)} foldery: {folder_names}{suffix}")
             else:
-                self.selection_summary_var.set("Wybierz folder ze zdjęciami bez etykiet.")
+                self.selection_summary_var.set("Dodaj jeden lub więcej folderów ze zdjęciami bez etykiet.")
             return
 
         if dataset_mode:
@@ -1575,13 +1886,15 @@ class CreateTaskDialog(BaseDialog):
                 suffix = "" if len(self.images) <= 2 else f" i jeszcze {len(self.images) - 2}"
                 self.selection_summary_var.set(f"Wybrano {len(self.images)} zdjęć: {first_names}{suffix}")
             else:
-                self.selection_summary_var.set("Wybierz pojedyncze zdjęcia do zaimportowania.")
+                self.selection_summary_var.set("Dodaj pojedyncze zdjęcia do zaimportowania.")
             return
 
-        if self.source_path_var.get().strip():
-            self.selection_summary_var.set(f"Wideo: {Path(self.source_path_var.get().strip()).name}")
+        if self.source_paths:
+            video_names = ", ".join(Path(path).name for path in self.source_paths[:2])
+            suffix = "" if len(self.source_paths) <= 2 else f" i jeszcze {len(self.source_paths) - 2}"
+            self.selection_summary_var.set(f"Wybrano {len(self.source_paths)} pliki wideo: {video_names}{suffix}")
         else:
-            self.selection_summary_var.set("Wybierz plik wideo i ustaw odstęp między klatkami.")
+            self.selection_summary_var.set("Dodaj jeden lub więcej plików wideo i ustaw odstęp między klatkami.")
 
     def _save(self) -> None:
         if not self.name_var.get().strip():
@@ -1590,8 +1903,14 @@ class CreateTaskDialog(BaseDialog):
         import_mode = self._current_import_mode()
         source_path = self.source_path_var.get().strip()
         image_paths = list(self.images)
-        if import_mode == "folder" and not source_path:
-            messagebox.showwarning("Brak danych", "Wybierz folder ze zdjęciami.", parent=self)
+        folder_paths = list(self.source_paths)
+        video_paths = list(self.source_paths)
+        if import_mode == "folder" and source_path and not folder_paths:
+            folder_paths = [source_path]
+        if import_mode == "video" and source_path and not video_paths:
+            video_paths = [source_path]
+        if import_mode == "folder" and not folder_paths:
+            messagebox.showwarning("Brak danych", "Wybierz przynajmniej jeden folder ze zdjęciami.", parent=self)
             return
         if import_mode == "dataset" and not source_path:
             messagebox.showwarning("Brak danych", "Wybierz folder datasetu.", parent=self)
@@ -1602,8 +1921,8 @@ class CreateTaskDialog(BaseDialog):
         if import_mode == "images" and not image_paths:
             messagebox.showwarning("Brak danych", "Wybierz przynajmniej jedno zdjęcie.", parent=self)
             return
-        if import_mode == "video" and not source_path:
-            messagebox.showwarning("Brak danych", "Wybierz plik wideo.", parent=self)
+        if import_mode == "video" and not video_paths:
+            messagebox.showwarning("Brak danych", "Wybierz przynajmniej jeden plik wideo.", parent=self)
             return
         if import_mode == "video" and self.frame_stride_var.get() < 1:
             messagebox.showwarning("Brak danych", "Odstęp między klatkami musi być dodatni.", parent=self)
@@ -1611,11 +1930,20 @@ class CreateTaskDialog(BaseDialog):
         self.result = {
             "task_name": self.name_var.get().strip(),
             "import_mode": import_mode,
-            "dataset_folder": source_path if import_mode in {"folder", "dataset"} else "",
+            "dataset_folder": source_path if import_mode == "dataset" else (folder_paths[0] if folder_paths else ""),
+            "dataset_folders": folder_paths if import_mode == "folder" else [],
             "dataset_format": self.dataset_format_var.get().strip() if import_mode == "dataset" else "",
             "image_paths": image_paths,
-            "video_path": source_path if import_mode == "video" else "",
+            "video_path": video_paths[0] if video_paths else "",
+            "video_paths": video_paths if import_mode == "video" else [],
             "frame_stride": int(self.frame_stride_var.get()),
+            "dialog_state": {
+                "source_type": self.source_type_var.get().strip(),
+                "source_path": source_path if import_mode == "dataset" else (folder_paths[0] if folder_paths else ""),
+                "source_paths": folder_paths if import_mode == "folder" else (video_paths if import_mode == "video" else []),
+                "dataset_format": self.dataset_format_var.get().strip(),
+                "frame_stride": int(self.frame_stride_var.get()),
+            },
         }
         self.destroy()
 
